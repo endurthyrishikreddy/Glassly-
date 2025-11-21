@@ -1,7 +1,8 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { Message } from '../types';
 import { User, Bot, Volume2, Loader2 } from 'lucide-react';
 import { generateSpeech } from '../services/geminiService';
+import { ChartRenderer, ChartData } from './ChartRenderer';
 
 interface MessageBubbleProps {
   message: Message;
@@ -32,6 +33,36 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({ message }) => {
     }
   };
 
+  // Parse message content to separate Text and Charts
+  const contentParts = useMemo(() => {
+    if (isUser) return [{ type: 'text', content: message.text }];
+
+    // Regex to find code blocks identified as json
+    const parts = message.text.split(/(```json[\s\S]*?```)/g);
+    
+    return parts.map((part) => {
+      // Check if part is a JSON code block
+      if (part.startsWith('```json') && part.endsWith('```')) {
+        try {
+          const jsonStr = part.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+          const parsed = JSON.parse(jsonStr);
+          
+          // Simple validation to check if it looks like our chart schema
+          if (parsed.type && Array.isArray(parsed.data) && Array.isArray(parsed.series)) {
+            return { type: 'chart', content: parsed as ChartData };
+          }
+        } catch (e) {
+          // If parse fails, just treat as text/code
+          return { type: 'text', content: part };
+        }
+      }
+      // If part is empty string due to split, ignore or handle
+      if (!part.trim()) return null;
+      return { type: 'text', content: part };
+    }).filter(Boolean) as Array<{ type: 'text' | 'chart', content: string | ChartData }>;
+
+  }, [message.text, isUser]);
+
   return (
     <div className={`flex w-full mb-4 md:mb-6 ${isUser ? 'justify-end' : 'justify-start'} animate-fade-in-up group px-1`}>
       <div className={`flex max-w-[95%] md:max-w-[85%] ${isUser ? 'flex-row-reverse' : 'flex-row'} items-start gap-2 md:gap-3 min-w-0`}>
@@ -58,8 +89,18 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({ message }) => {
             {/* Shine effect */}
             <div className="absolute inset-0 rounded-2xl bg-gradient-to-br from-white/10 to-transparent pointer-events-none" />
             
-            <div className="font-normal tracking-wide break-words">
-              {message.text}
+            <div className="font-normal tracking-wide break-words w-full">
+              {contentParts.map((item, index) => {
+                if (item.type === 'chart') {
+                  return <ChartRenderer key={index} config={item.content as ChartData} />;
+                }
+                return (
+                  <span key={index}>
+                    {(item.content as string)}
+                  </span>
+                );
+              })}
+              
               {message.isStreaming && (
                 <span className="inline-flex ml-1 gap-0.5 align-baseline">
                   <span className="w-1 h-1 bg-current rounded-full animate-bounce" style={{ animationDelay: '0ms' }}/>

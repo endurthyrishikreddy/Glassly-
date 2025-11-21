@@ -74,6 +74,20 @@ const SettingsSection: React.FC<SettingsSectionProps> = ({ id, title, icon: Icon
   );
 };
 
+const DEFAULT_SYSTEM_INSTRUCTION = `You are a helpful, concise AI assistant living in a transparent glass overlay.
+Keep answers brief and relevant.
+If the user asks for a visualization, chart, or graph, respond with a JSON code block in the following format:
+\`\`\`json
+{
+  "type": "bar" | "line" | "area" | "pie",
+  "title": "Chart Title",
+  "data": [ {"name": "Category A", "val1": 10, "val2": 20}, ... ],
+  "xAxisKey": "name",
+  "series": [ {"dataKey": "val1", "name": "Metric 1", "color": "#6366f1"} ]
+}
+\`\`\`
+Follow the JSON with a brief textual summary.`;
+
 export const GlassOverlay: React.FC = () => {
   // --- State ---
   const [isOpen, setIsOpen] = useState(true);
@@ -90,6 +104,12 @@ export const GlassOverlay: React.FC = () => {
   const [showSettings, setShowSettings] = useState(false); // Settings View Toggle
   const [showHistory, setShowHistory] = useState(false); // History View Toggle
   const [activeSettingsSection, setActiveSettingsSection] = useState<string>('model'); // 'model', 'tools', 'creativity'
+  
+  // Resize State
+  const [size, setSize] = useState<{width: number, height: number}>({ width: 0, height: 0 }); // 0 means use defaults/CSS
+  const [isResizing, setIsResizing] = useState(false);
+  const [resizeDirection, setResizeDirection] = useState<string | null>(null);
+  const resizeStartRef = useRef<{x: number, y: number, w: number, h: number, posX: number, posY: number} | null>(null);
 
   // Cropping / Snipping Tool State
   const [isCropping, setIsCropping] = useState(false);
@@ -127,7 +147,7 @@ export const GlassOverlay: React.FC = () => {
               isScreenActive: false,
               model: config.model || ModelType.FLASH,
               temperature: config.temperature !== undefined ? config.temperature : 0.7,
-              systemInstruction: config.systemInstruction || "You are a helpful, concise AI assistant living in a transparent glass overlay. Keep answers brief and relevant."
+              systemInstruction: config.systemInstruction || DEFAULT_SYSTEM_INSTRUCTION
             }
           };
         } catch (e) { console.error("Failed to load chat state", e); }
@@ -138,7 +158,7 @@ export const GlassOverlay: React.FC = () => {
       messages: [{
         id: 'welcome',
         role: 'model',
-        text: "I am your advanced AI overlay. I can see your screen, browse the web, and think deeply about complex problems.",
+        text: "I am your advanced AI overlay. I can see your screen, browse the web, and generate charts for you.",
         timestamp: Date.now()
       }],
       isLoading: false,
@@ -150,7 +170,7 @@ export const GlassOverlay: React.FC = () => {
         isScreenActive: false,
         model: ModelType.FLASH,
         temperature: 0.7,
-        systemInstruction: "You are a helpful, concise AI assistant living in a transparent glass overlay. Keep answers brief and relevant."
+        systemInstruction: DEFAULT_SYSTEM_INSTRUCTION
       }
     };
   });
@@ -702,6 +722,93 @@ export const GlassOverlay: React.FC = () => {
     };
   }, [isDragging, isPiP, isCropping]);
 
+  // --- Resize Logic ---
+  const handleResizeMouseDown = (e: React.MouseEvent, direction: string) => {
+    e.stopPropagation();
+    e.preventDefault();
+    if (!overlayRef.current) return;
+    const rect = overlayRef.current.getBoundingClientRect();
+    
+    // Initialize position if it's not set (centered state) to prevent jumping
+    const currentX = position ? position.x : rect.left;
+    const currentY = position ? position.y : rect.top;
+    if (!position) {
+        setPosition({ x: currentX, y: currentY });
+    }
+
+    resizeStartRef.current = {
+      x: e.clientX,
+      y: e.clientY,
+      w: rect.width,
+      h: rect.height,
+      posX: currentX,
+      posY: currentY
+    };
+    setResizeDirection(direction);
+    setIsResizing(true);
+  };
+
+  useEffect(() => {
+    const handleResizeMove = (e: MouseEvent) => {
+      if (!isResizing || !resizeStartRef.current || !resizeDirection) return;
+      
+      const { x: startX, y: startY, w: startW, h: startH, posX: startPosX, posY: startPosY } = resizeStartRef.current;
+      const deltaX = e.clientX - startX;
+      const deltaY = e.clientY - startY;
+      
+      let newW = startW;
+      let newH = startH;
+      let newX = startPosX;
+      let newY = startPosY;
+
+      const MIN_W = 350;
+      const MIN_H = 400;
+
+      // Calculate new dimensions and position based on direction
+      if (resizeDirection.includes('e')) {
+        newW = Math.max(MIN_W, startW + deltaX);
+      }
+      if (resizeDirection.includes('s')) {
+        newH = Math.max(MIN_H, startH + deltaY);
+      }
+      if (resizeDirection.includes('w')) {
+        const proposedW = startW - deltaX;
+        if (proposedW >= MIN_W) {
+           newW = proposedW;
+           newX = startPosX + deltaX;
+        }
+      }
+      if (resizeDirection.includes('n')) {
+        const proposedH = startH - deltaY;
+        if (proposedH >= MIN_H) {
+           newH = proposedH;
+           newY = startPosY + deltaY;
+        }
+      }
+      
+      setSize({ width: newW, height: newH });
+      
+      // Only update position if we are resizing from Top or Left
+      if (resizeDirection.includes('w') || resizeDirection.includes('n')) {
+         setPosition({ x: newX, y: newY });
+      }
+    };
+
+    const handleResizeUp = () => {
+      setIsResizing(false);
+      setResizeDirection(null);
+    };
+
+    if (isResizing) {
+      window.addEventListener('mousemove', handleResizeMove);
+      window.addEventListener('mouseup', handleResizeUp);
+    }
+    return () => {
+      window.removeEventListener('mousemove', handleResizeMove);
+      window.removeEventListener('mouseup', handleResizeUp);
+    };
+  }, [isResizing, resizeDirection]);
+
   // --- PiP Logic (Multi-Screen Support) ---
   const togglePiP = async () => {
     if (isPiP && pipWindowRef.current) {
@@ -780,9 +887,14 @@ export const GlassOverlay: React.FC = () => {
     ? { width: '100%', height: '100vh', borderRadius: 0, border: 'none' }
     : isCropping
       ? { inset: 0, width: '100%', height: '100%', transform: 'none', borderRadius: 0 }
-      : position 
-        ? { left: `${position.x}px`, top: `${position.y}px`, transform: 'none' }
-        : {};
+      : {
+          left: position ? `${position.x}px` : '50%',
+          top: position ? `${position.y}px` : '50%',
+          transform: position ? 'none' : 'translate(-50%, -50%)',
+          // If minimized, ignore custom size and let CSS classes handle dimensions, or use 'auto' to wrap content
+          width: isMinimized ? 'auto' : (size.width || undefined),
+          height: isMinimized ? 'auto' : (size.height || undefined)
+        };
 
   const stealthClasses = isStealth 
     ? 'bg-black/5 backdrop-blur-[2px] border-white/5 shadow-none opacity-10 hover:opacity-100 hover:bg-black/80 hover:backdrop-blur-2xl hover:shadow-2xl hover:border-white/20' 
@@ -798,8 +910,8 @@ export const GlassOverlay: React.FC = () => {
     <div 
       ref={overlayRef}
       style={containerStyle}
-      className={`${isPiP ? 'relative h-full w-full' : 'fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2'} 
-        ${isPiP || isCropping ? '' : isMinimized ? 'w-[380px] h-[64px]' : 'w-[90vw] h-[80vh] md:w-[500px] md:h-[700px]'} 
+      className={`${isPiP ? 'relative h-full w-full' : 'fixed'} 
+        ${isPiP || isCropping ? '' : isMinimized ? 'w-[380px] h-[64px]' : (!size.width ? 'w-[90vw] h-[80vh] md:w-[500px] md:h-[700px]' : '')} 
         ${isPiP ? 'bg-black' : croppingClasses} 
         ${visibilityClasses}
         border z-50 flex flex-col ${isCropping ? '' : isPiP ? '' : 'rounded-[32px]'} overflow-hidden transition-all duration-500 ease-out group/overlay`}
@@ -815,6 +927,23 @@ export const GlassOverlay: React.FC = () => {
           100% { top: 100%; opacity: 0; }
         }
       `}</style>
+
+      {/* --- Resize Handles --- */}
+      {!isPiP && !isMinimized && !isCropping && (
+         <>
+            {/* Edges */}
+            <div onMouseDown={(e) => handleResizeMouseDown(e, 'n')} className="absolute top-0 inset-x-4 h-2 cursor-ns-resize z-50 hover:bg-white/20 transition-colors rounded-full" />
+            <div onMouseDown={(e) => handleResizeMouseDown(e, 's')} className="absolute bottom-0 inset-x-4 h-2 cursor-ns-resize z-50 hover:bg-white/20 transition-colors rounded-full" />
+            <div onMouseDown={(e) => handleResizeMouseDown(e, 'w')} className="absolute inset-y-4 left-0 w-2 cursor-ew-resize z-50 hover:bg-white/20 transition-colors rounded-full" />
+            <div onMouseDown={(e) => handleResizeMouseDown(e, 'e')} className="absolute inset-y-4 right-0 w-2 cursor-ew-resize z-50 hover:bg-white/20 transition-colors rounded-full" />
+            
+            {/* Corners */}
+            <div onMouseDown={(e) => handleResizeMouseDown(e, 'nw')} className="absolute top-0 left-0 w-6 h-6 cursor-nwse-resize z-50 hover:bg-white/20 rounded-tl-[32px]" />
+            <div onMouseDown={(e) => handleResizeMouseDown(e, 'ne')} className="absolute top-0 right-0 w-6 h-6 cursor-nesw-resize z-50 hover:bg-white/20 rounded-tr-[32px]" />
+            <div onMouseDown={(e) => handleResizeMouseDown(e, 'sw')} className="absolute bottom-0 left-0 w-6 h-6 cursor-nesw-resize z-50 hover:bg-white/20 rounded-bl-[32px]" />
+            <div onMouseDown={(e) => handleResizeMouseDown(e, 'se')} className="absolute bottom-0 right-0 w-6 h-6 cursor-nwse-resize z-50 hover:bg-white/20 rounded-br-[32px]" />
+         </>
+      )}
       
       {/* --- Cropping UI Layer --- */}
       {isCropping && tempScreenshot && (
@@ -897,7 +1026,7 @@ export const GlassOverlay: React.FC = () => {
       {/* --- Header --- */}
       {!isCropping && (
       <div 
-        className={`relative flex-none flex items-center justify-between px-5 py-4 select-none group/header ${!isPiP && !isMinimized ? 'cursor-grab active:cursor-grabbing' : ''} transition-colors duration-300 ${isDragging ? 'bg-white/10 border-b border-white/10' : 'bg-gradient-to-b from-white/5 to-transparent'}`}
+        className={`relative flex-none flex items-center justify-between px-5 py-4 select-none group/header ${!isPiP ? 'cursor-grab active:cursor-grabbing' : ''} transition-colors duration-300 ${isDragging ? 'bg-white/10 border-b border-white/10' : 'bg-gradient-to-b from-white/5 to-transparent'}`}
         onMouseDown={handleMouseDown}
         onDoubleClick={() => !isPiP && setIsMinimized(!isMinimized)}
       >
@@ -1222,7 +1351,7 @@ export const GlassOverlay: React.FC = () => {
       )}
 
       {/* --- Chat Area --- */}
-      <div className={`flex-1 flex flex-col overflow-hidden transition-opacity duration-300 ${isMinimized && !isPiP ? 'opacity-0' : 'opacity-100'} ${showSettings || showHistory || isCropping ? 'hidden' : 'flex'}`}>
+      <div className={`flex-1 flex flex-col overflow-hidden transition-opacity duration-300 ${isMinimized && !isPiP ? 'opacity-0' : 'opacity-100'} ${(isMinimized && !isPiP) || showSettings || showHistory || isCropping ? 'hidden' : 'flex'}`}>
         <div className={`flex-1 overflow-y-auto p-4 md:p-5 space-y-4 md:space-y-6 custom-scrollbar scroll-smooth ${isStealth ? 'opacity-20 group-hover/overlay:opacity-100 transition-opacity duration-500' : ''}`}>
           {chatState.messages.map((msg) => (
             <MessageBubble key={msg.id} message={msg} />
@@ -1300,6 +1429,18 @@ export const GlassOverlay: React.FC = () => {
                 <div className={`w-1.5 h-1.5 rounded-full ${isOnline ? 'bg-emerald-500' : 'bg-red-500'} animate-pulse`} />
                 {isOnline ? 'Online' : 'Offline'}
              </div>
+             
+             {/* Add Resize Handle to bottom right of the UI area (inside the footer) */}
+             {!isPiP && !isMinimized && !isCropping && (
+                <div 
+                  className="absolute bottom-2 right-2 w-4 h-4 cursor-se-resize flex items-end justify-end opacity-30 hover:opacity-100 transition-opacity"
+                  onMouseDown={(e) => handleResizeMouseDown(e, 'se')}
+                >
+                   <svg viewBox="0 0 10 10" className="w-full h-full fill-current text-white">
+                     <path d="M10 10 L0 10 L10 0 Z" />
+                   </svg>
+                </div>
+             )}
            </div>
         </div>
       </div>
