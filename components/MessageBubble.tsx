@@ -33,23 +33,23 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({ message }) => {
   };
 
   return (
-    <div className={`flex w-full mb-6 ${isUser ? 'justify-end' : 'justify-start'} animate-fade-in-up group`}>
-      <div className={`flex max-w-[90%] md:max-w-[80%] ${isUser ? 'flex-row-reverse' : 'flex-row'} items-start gap-3`}>
+    <div className={`flex w-full mb-4 md:mb-6 ${isUser ? 'justify-end' : 'justify-start'} animate-fade-in-up group px-1`}>
+      <div className={`flex max-w-[95%] md:max-w-[85%] ${isUser ? 'flex-row-reverse' : 'flex-row'} items-start gap-2 md:gap-3 min-w-0`}>
         
         {/* Avatar */}
-        <div className={`flex-shrink-0 w-8 h-8 rounded-full flex items-center justify-center mt-1 shadow-lg ${
+        <div className={`flex-shrink-0 w-6 h-6 md:w-8 md:h-8 rounded-full flex items-center justify-center mt-1 shadow-lg ${
           isUser 
             ? 'bg-gradient-to-br from-indigo-500 to-purple-600' 
             : 'bg-gradient-to-br from-emerald-500 to-teal-600'
         }`}>
-          {isUser ? <User size={14} className="text-white" /> : <Bot size={14} className="text-white" />}
+          {isUser ? <User size={12} className="text-white md:w-[14px] md:h-[14px]" /> : <Bot size={12} className="text-white md:w-[14px] md:h-[14px]" />}
         </div>
 
         {/* Content Column */}
-        <div className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}>
+        <div className={`flex flex-col min-w-0 ${isUser ? 'items-end' : 'items-start'}`}>
           <div className={`
-            relative px-5 py-3.5 rounded-2xl text-sm md:text-[15px] leading-relaxed shadow-xl backdrop-blur-xl
-            transition-all duration-300
+            relative px-4 py-3 md:px-5 md:py-3.5 rounded-2xl text-sm md:text-[15px] leading-relaxed shadow-xl backdrop-blur-xl
+            transition-all duration-300 break-words whitespace-pre-wrap max-w-full
             ${isUser 
               ? 'bg-indigo-600/90 text-white rounded-tr-none border border-indigo-400/30' 
               : 'bg-gray-800/70 text-gray-100 rounded-tl-none border border-white/10'
@@ -58,10 +58,10 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({ message }) => {
             {/* Shine effect */}
             <div className="absolute inset-0 rounded-2xl bg-gradient-to-br from-white/10 to-transparent pointer-events-none" />
             
-            <div className="whitespace-pre-wrap font-normal tracking-wide">
+            <div className="font-normal tracking-wide break-words">
               {message.text}
               {message.isStreaming && (
-                <span className="inline-flex ml-1 gap-0.5">
+                <span className="inline-flex ml-1 gap-0.5 align-baseline">
                   <span className="w-1 h-1 bg-current rounded-full animate-bounce" style={{ animationDelay: '0ms' }}/>
                   <span className="w-1 h-1 bg-current rounded-full animate-bounce" style={{ animationDelay: '150ms' }}/>
                   <span className="w-1 h-1 bg-current rounded-full animate-bounce" style={{ animationDelay: '300ms' }}/>
@@ -71,8 +71,8 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({ message }) => {
           </div>
 
           {/* Footer Actions */}
-          <div className={`flex items-center gap-2 mt-1.5 opacity-0 group-hover:opacity-100 transition-opacity duration-200 ${isUser ? 'flex-row-reverse' : 'flex-row'}`}>
-            <span className="text-[10px] text-white/30 font-medium">
+          <div className={`flex items-center gap-2 mt-1 opacity-0 group-hover:opacity-100 transition-opacity duration-200 ${isUser ? 'flex-row-reverse' : 'flex-row'}`}>
+            <span className="text-[10px] text-white/30 font-medium whitespace-nowrap">
               {new Date(message.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
             </span>
             

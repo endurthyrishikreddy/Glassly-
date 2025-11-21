@@ -3,6 +3,7 @@
   "description": "A transparent, glass-morphism chat overlay powered by Gemini 2.5 Flash.",
   "requestFramePermissions": [
     "microphone",
-    "display-capture"
+    "display-capture",
+    "geolocation"
   ]
 }

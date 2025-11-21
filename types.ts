@@ -1,3 +1,4 @@
+
 export interface Message {
   id: string;
   role: 'user' | 'model';
@@ -14,6 +15,7 @@ export interface ChatState {
   error: string | null;
   config: {
     useSearch: boolean;
+    useMaps: boolean;
     useThinking: boolean;
     isScreenActive: boolean;
     // Model Configuration
@@ -21,6 +23,14 @@ export interface ChatState {
     temperature: number;
     systemInstruction: string;
   };
+}
+
+export interface ChatSession {
+  id: string;
+  title: string;
+  timestamp: number;
+  messages: Message[];
+  config: ChatState['config'];
 }
 
 export enum ModelType {

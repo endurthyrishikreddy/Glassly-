@@ -3,9 +3,11 @@ import { createPortal } from 'react-dom';
 import { 
   Send, Sparkles, RefreshCw, Minimize2, Maximize2, ExternalLink, 
   WifiOff, Wifi, Eye, X, Mic, BrainCircuit, Globe, Monitor, GripHorizontal,
-  Ghost, EyeOff, Settings, ChevronLeft, Save, Crop, ScanLine, Check, Image as ImageIcon
+  Ghost, EyeOff, Settings, ChevronLeft, Save, Crop, ScanLine, Check, Image as ImageIcon,
+  Loader2, CheckCircle, MapPin, ChevronDown, Cpu, Wrench, Palette, Sliders, MessageSquare,
+  History, Trash2, Archive, Clock
 } from 'lucide-react';
-import { Message, ChatState, ModelType } from '../types';
+import { Message, ChatState, ModelType, ChatSession } from '../types';
 import { createChatSession, sendMessageStream, transcribeAudio, extractTextFromImage } from '../services/geminiService';
 import { MessageBubble } from './MessageBubble';
 import { Chat, Content } from "@google/genai";
@@ -19,7 +21,9 @@ declare var ImageCapture: {
   new (track: MediaStreamTrack): ImageCapture;
 };
 
-const STORAGE_KEY = 'gemini_glass_overlay_history_v3';
+// Updated key to ensure clean config load for new features
+const STORAGE_KEY = 'gemini_glass_overlay_history_v6';
+const SAVED_SESSIONS_KEY = 'gemini_glass_saved_sessions_v1';
 
 interface ScreenshotData {
   data: string; // base64
@@ -32,6 +36,43 @@ interface Rect {
   w: number;
   h: number;
 }
+
+// --- Helper Component for Settings Section ---
+interface SettingsSectionProps {
+  id: string;
+  title: string;
+  icon: any;
+  activeSection: string;
+  onToggle: (id: string) => void;
+  children: React.ReactNode;
+}
+
+const SettingsSection: React.FC<SettingsSectionProps> = ({ id, title, icon: Icon, activeSection, onToggle, children }) => {
+  const isOpen = activeSection === id;
+  return (
+    <div className={`rounded-xl overflow-hidden border transition-all duration-300 ${isOpen ? 'bg-white/5 border-white/20' : 'bg-transparent border-white/5 hover:bg-white/5'}`}>
+        <button
+            onClick={() => onToggle(isOpen ? '' : id)}
+            className="w-full flex items-center justify-between p-4 transition-colors outline-none"
+        >
+            <div className="flex items-center gap-3 text-white/90">
+                <div className={`p-2 rounded-lg transition-colors ${isOpen ? 'bg-indigo-500/20 text-indigo-300' : 'bg-white/5 text-white/40'}`}>
+                    <Icon size={18} />
+                </div>
+                <span className="font-medium text-sm tracking-wide">{title}</span>
+            </div>
+            <ChevronDown size={16} className={`text-white/40 transition-transform duration-300 ${isOpen ? 'rotate-180' : ''}`} />
+        </button>
+        <div className={`transition-all duration-300 ease-in-out overflow-hidden ${isOpen ? 'max-h-[1000px] opacity-100' : 'max-h-0 opacity-0'}`}>
+            <div className="p-4 pt-0 border-t border-white/5">
+                <div className="pt-4 space-y-4">
+                    {children}
+                </div>
+            </div>
+        </div>
+    </div>
+  );
+};
 
 export const GlassOverlay: React.FC = () => {
   // --- State ---
@@ -47,6 +88,8 @@ export const GlassOverlay: React.FC = () => {
   const [isStealth, setIsStealth] = useState(false); // Low opacity mode
   const [isVisible, setIsVisible] = useState(true);  // Fully hidden/shown toggle
   const [showSettings, setShowSettings] = useState(false); // Settings View Toggle
+  const [showHistory, setShowHistory] = useState(false); // History View Toggle
+  const [activeSettingsSection, setActiveSettingsSection] = useState<string>('model'); // 'model', 'tools', 'creativity'
 
   // Cropping / Snipping Tool State
   const [isCropping, setIsCropping] = useState(false);
@@ -55,6 +98,10 @@ export const GlassOverlay: React.FC = () => {
   const [isDrawingCrop, setIsDrawingCrop] = useState(false);
   const [cropStart, setCropStart] = useState<{x: number, y: number} | null>(null);
   const [attachedImage, setAttachedImage] = useState<ScreenshotData | null>(null);
+  
+  // OCR & Feedback State
+  const [ocrState, setOcrState] = useState<'idle' | 'scanning' | 'success' | 'error'>('idle');
+  const [inputHighlight, setInputHighlight] = useState(false);
 
   // PiP State
   const [isPiP, setIsPiP] = useState(false);
@@ -67,24 +114,26 @@ export const GlassOverlay: React.FC = () => {
       if (saved) {
         try {
           const parsed = JSON.parse(saved);
-          // Migration for old configs
+          // Robust Migration for configs
           const config = parsed.config || {};
           return {
             messages: parsed.messages || [],
             isLoading: false,
             error: null,
             config: {
-              useSearch: config.useSearch || false,
-              useThinking: config.useThinking || false,
+              useSearch: config.useSearch ?? false, // Use ?? to allow false as valid
+              useMaps: config.useMaps ?? false,
+              useThinking: config.useThinking ?? false,
               isScreenActive: false,
               model: config.model || ModelType.FLASH,
               temperature: config.temperature !== undefined ? config.temperature : 0.7,
               systemInstruction: config.systemInstruction || "You are a helpful, concise AI assistant living in a transparent glass overlay. Keep answers brief and relevant."
             }
           };
-        } catch (e) { console.error(e); }
+        } catch (e) { console.error("Failed to load chat state", e); }
       }
     }
+    // Default Initial State
     return {
       messages: [{
         id: 'welcome',
@@ -96,6 +145,7 @@ export const GlassOverlay: React.FC = () => {
       error: null,
       config: { 
         useSearch: false, 
+        useMaps: false,
         useThinking: false, 
         isScreenActive: false,
         model: ModelType.FLASH,
@@ -103,6 +153,19 @@ export const GlassOverlay: React.FC = () => {
         systemInstruction: "You are a helpful, concise AI assistant living in a transparent glass overlay. Keep answers brief and relevant."
       }
     };
+  });
+
+  // Saved Sessions State
+  const [sessions, setSessions] = useState<ChatSession[]>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem(SAVED_SESSIONS_KEY);
+      if (saved) {
+        try {
+          return JSON.parse(saved);
+        } catch (e) { console.error("Failed to load saved sessions", e); }
+      }
+    }
+    return [];
   });
 
   // Refs
@@ -146,13 +209,27 @@ export const GlassOverlay: React.FC = () => {
     };
   }, []);
 
-  // Persist to LocalStorage
+  // Persist Current State to LocalStorage
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({
+    const stateToSave = {
       messages: chatState.messages,
-      config: chatState.config
-    }));
+      config: chatState.config // content of this object is verified to contain all keys
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(stateToSave));
   }, [chatState.messages, chatState.config]);
+
+  // Persist Sessions to LocalStorage
+  useEffect(() => {
+    localStorage.setItem(SAVED_SESSIONS_KEY, JSON.stringify(sessions));
+  }, [sessions]);
+
+  // Input Highlight Timeout
+  useEffect(() => {
+    if (inputHighlight) {
+      const timer = setTimeout(() => setInputHighlight(false), 2000);
+      return () => clearTimeout(timer);
+    }
+  }, [inputHighlight]);
 
   // Initialize Chat (Re-create if config changes)
   const initializeChat = useCallback(() => {
@@ -161,14 +238,14 @@ export const GlassOverlay: React.FC = () => {
       parts: [{ text: msg.text }]
     }));
     
-    // The service handles logic to upgrade model if thinking is true
     chatSessionRef.current = createChatSession(
       {
         model: chatState.config.model,
         temperature: chatState.config.temperature,
         systemInstruction: chatState.config.systemInstruction,
         useThinking: chatState.config.useThinking,
-        useSearch: chatState.config.useSearch
+        useSearch: chatState.config.useSearch,
+        useMaps: chatState.config.useMaps
       },
       history
     );
@@ -184,19 +261,57 @@ export const GlassOverlay: React.FC = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   };
   useEffect(() => {
-    if (!isMinimized && isVisible && !showSettings && !isCropping) scrollToBottom();
-  }, [chatState.messages, isOpen, isMinimized, isPiP, isVisible, showSettings, isCropping]);
+    if (!isMinimized && isVisible && !showSettings && !showHistory && !isCropping) scrollToBottom();
+  }, [chatState.messages, isOpen, isMinimized, isPiP, isVisible, showSettings, showHistory, isCropping]);
 
   // --- Features ---
 
+  // History / Session Management
+  const handleSaveSession = () => {
+    if (chatState.messages.length <= 1) return; // Don't save empty default chats
+
+    const firstUserMessage = chatState.messages.find(m => m.role === 'user');
+    const title = firstUserMessage 
+      ? (firstUserMessage.text.slice(0, 30) + (firstUserMessage.text.length > 30 ? '...' : ''))
+      : 'New Chat Session';
+
+    const newSession: ChatSession = {
+      id: Date.now().toString(),
+      title,
+      timestamp: Date.now(),
+      messages: chatState.messages,
+      config: chatState.config
+    };
+
+    setSessions(prev => [newSession, ...prev]);
+    // Visual feedback could be added here
+  };
+
+  const handleLoadSession = (session: ChatSession) => {
+    setChatState({
+      messages: session.messages,
+      isLoading: false,
+      error: null,
+      config: session.config
+    });
+    setShowHistory(false);
+    setTimeout(scrollToBottom, 100);
+  };
+
+  const handleDeleteSession = (e: React.MouseEvent, id: string) => {
+    e.stopPropagation();
+    setSessions(prev => prev.filter(s => s.id !== id));
+  };
+
   // 1. Screen Sharing (Vision)
-  const toggleScreenShare = async () => {
-    if (isScreenShared) {
+  const toggleScreenShare = async (): Promise<MediaStream | null> => {
+    if (isScreenShared && mediaStream) {
       // Stop sharing
-      mediaStream?.getTracks().forEach(track => track.stop());
+      mediaStream.getTracks().forEach(track => track.stop());
       setMediaStream(null);
       setIsScreenShared(false);
       if (isCropping) cancelCrop();
+      return null;
     } else {
       try {
         const stream = await navigator.mediaDevices.getDisplayMedia({
@@ -212,33 +327,32 @@ export const GlassOverlay: React.FC = () => {
 
         setMediaStream(stream);
         setIsScreenShared(true);
+        return stream;
       } catch (err) {
-        console.error("Screen share cancelled", err);
-        // If user cancelled, we don't error. If permission failed, we might show an alert.
-        if (err instanceof DOMException && err.name !== 'NotAllowedError') {
-            setChatState(prev => ({...prev, error: "Screen sharing failed. Please check permissions."}));
+        console.log("Screen share cancelled or denied");
+        if (err instanceof DOMException && err.name !== 'NotAllowedError' && err.name !== 'AbortError') {
+            setChatState(prev => ({...prev, error: "Screen share failed. Check permissions."}));
         }
+        return null;
       }
     }
   };
 
-  const captureFrame = async (): Promise<ScreenshotData | null> => {
-    if (!mediaStream) return null;
+  const captureFrame = async (streamToUse?: MediaStream): Promise<ScreenshotData | null> => {
+    const activeStream = streamToUse || mediaStream;
+    if (!activeStream) return null;
     
-    // Smart Capture: Briefly hide the overlay so we don't block the content
     const wasVisible = isVisible;
     const wasCropping = isCropping; 
 
-    // If we are already in cropping mode, we are displaying a static image, 
-    // so we don't need to hide/unhide. But if we are capturing FOR the crop mode:
+    // Only hide if we are visible, not in PiP, and not already looking at a static crop image.
     if (wasVisible && !isPiP && !wasCropping) {
        setIsVisible(false);
-       // Wait for render cycle to hide DOM
-       await new Promise(resolve => setTimeout(resolve, 250));
+       await new Promise(resolve => setTimeout(resolve, 300));
     }
 
     try {
-      const track = mediaStream.getVideoTracks()[0];
+      const track = activeStream.getVideoTracks()[0];
       const imageCapture = new ImageCapture(track);
       const bitmap = await imageCapture.grabFrame();
       
@@ -248,9 +362,8 @@ export const GlassOverlay: React.FC = () => {
       const context = canvas.getContext('2d');
       if (context) {
         context.drawImage(bitmap, 0, 0);
-        const base64Url = canvas.toDataURL('image/jpeg', 0.8);
+        const base64Url = canvas.toDataURL('image/jpeg', 0.85);
         
-        // Restore visibility
         if (wasVisible && !isPiP && !wasCropping) setIsVisible(true);
         
         return {
@@ -268,27 +381,14 @@ export const GlassOverlay: React.FC = () => {
   // --- Crop / Region Capture Logic ---
   
   const startRegionCapture = async () => {
-    if (!mediaStream) {
-      await toggleScreenShare();
-      // If user cancelled the share, mediaStream will still be null (due to state update lag or rejection)
-      // We can check if we are shared in a slight timeout or return if isScreenShared is false
-      // But since toggleScreenShare is async, we can check after await.
-      // Ideally, we can't immediately capture after setting stream state due to React rendering.
-      // So we might need a second click or use a ref/effect.
-      // For simplicity: prompt user to share first if not shared.
+    let stream = mediaStream;
+    if (!stream) {
+      stream = await toggleScreenShare();
     }
-    
-    // We need the stream active to capture
-    if (!mediaStream && !isScreenShared) {
-        // Wait for next cycle or user interaction
-        return; 
-    }
-    
-    // Small delay to allow stream to spin up if just started
-    await new Promise(r => setTimeout(r, 500));
+    if (!stream) return;
+    if (!mediaStream) await new Promise(r => setTimeout(r, 500));
 
-    // Take the full screenshot
-    const screenShot = await captureFrame();
+    const screenShot = await captureFrame(stream);
     if (screenShot) {
       setTempScreenshot(`data:${screenShot.mimeType};base64,${screenShot.data}`);
       setIsCropping(true);
@@ -300,10 +400,11 @@ export const GlassOverlay: React.FC = () => {
     setIsCropping(false);
     setTempScreenshot(null);
     setCropRect(null);
+    setOcrState('idle');
   };
 
   const handleCropMouseDown = (e: React.MouseEvent) => {
-    if (!isCropping) return;
+    if (!isCropping || ocrState !== 'idle') return; 
     e.preventDefault();
     setIsDrawingCrop(true);
     const bounds = overlayRef.current?.getBoundingClientRect();
@@ -344,13 +445,9 @@ export const GlassOverlay: React.FC = () => {
 
     const canvas = document.createElement('canvas');
     
-    // We need to map the DOM coordinates (cropRect) to the actual Image dimensions
-    // Since the image is "object-contain" in full screen, we need to calculate ratio
-    const containerW = overlayRef.current?.clientWidth || 1;
-    const containerH = overlayRef.current?.clientHeight || 1;
+    const containerW = overlayRef.current?.clientWidth || window.innerWidth;
+    const containerH = overlayRef.current?.clientHeight || window.innerHeight;
     
-    // The image is displayed using object-contain. 
-    // We need to determine the actual rendered dimensions of the image.
     const imgRatio = img.width / img.height;
     const containerRatio = containerW / containerH;
     
@@ -368,7 +465,6 @@ export const GlassOverlay: React.FC = () => {
        offsetY = (containerH - renderH) / 2;
     }
 
-    // Map mouse coordinates to image coordinates
     const scaleX = img.width / renderW;
     const scaleY = img.height / renderH;
 
@@ -390,16 +486,23 @@ export const GlassOverlay: React.FC = () => {
       setAttachedImage({ data: croppedBase64, mimeType: 'image/jpeg' });
       cancelCrop();
     } else if (mode === 'ocr') {
-      setChatState(prev => ({ ...prev, isLoading: true }));
-      cancelCrop(); // Go back to chat to show loading
+      setOcrState('scanning');
       try {
         const text = await extractTextFromImage(croppedBase64);
-        setInputText(prev => (prev + "\n" + text).trim());
+        setInputText(prev => {
+          const trimmed = prev.trim();
+          return trimmed ? `${trimmed}\n${text}` : text;
+        });
+        setOcrState('success');
+        setInputHighlight(true);
+        setTimeout(() => {
+          cancelCrop();
+          if (inputRef.current) inputRef.current.focus();
+        }, 1200);
       } catch (e) {
         console.error(e);
-        setChatState(prev => ({ ...prev, error: "OCR Failed" }));
-      } finally {
-        setChatState(prev => ({ ...prev, isLoading: false }));
+        setOcrState('error');
+        setTimeout(() => setOcrState('idle'), 2000);
       }
     }
   };
@@ -421,9 +524,8 @@ export const GlassOverlay: React.FC = () => {
 
         mediaRecorder.onstop = async () => {
           const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/wav' });
-          stream.getTracks().forEach(track => track.stop()); // clean up mic
+          stream.getTracks().forEach(track => track.stop()); 
           
-          // Convert blob to base64
           const reader = new FileReader();
           reader.readAsDataURL(audioBlob);
           reader.onloadend = async () => {
@@ -456,15 +558,12 @@ export const GlassOverlay: React.FC = () => {
     if (chatState.isLoading || !isOnline) return;
 
     const currentText = inputText.trim();
-    
-    // Priority: Attached cropped image -> Full Screen Snapshot -> Text only
     let screenshot: ScreenshotData | null = attachedImage;
 
     if (!screenshot && isScreenShared) {
       screenshot = await captureFrame();
     }
 
-    // Create User Message
     const userMessage: Message = {
       id: Date.now().toString(),
       role: 'user',
@@ -479,7 +578,7 @@ export const GlassOverlay: React.FC = () => {
       error: null
     }));
     setInputText('');
-    setAttachedImage(null); // Clear attached image after sending
+    setAttachedImage(null);
 
     const history: Content[] = chatState.messages.map(msg => ({
       role: msg.role,
@@ -492,12 +591,12 @@ export const GlassOverlay: React.FC = () => {
         temperature: chatState.config.temperature,
         systemInstruction: chatState.config.systemInstruction,
         useThinking: chatState.config.useThinking,
-        useSearch: chatState.config.useSearch
+        useSearch: chatState.config.useSearch,
+        useMaps: chatState.config.useMaps
       },
       history
     );
 
-    // Placeholder Bot Message
     const botMessageId = (Date.now() + 1).toString();
     setChatState(prev => ({
       ...prev,
@@ -514,7 +613,7 @@ export const GlassOverlay: React.FC = () => {
       let fullResponse = '';
       await sendMessageStream(
         session,
-        currentText || (screenshot ? "Analyze this." : ""),
+        currentText || (screenshot ? "Analyze this." : "Hello."),
         screenshot,
         (chunk) => {
           fullResponse += chunk;
@@ -569,9 +668,26 @@ export const GlassOverlay: React.FC = () => {
     const handleMouseMove = (e: MouseEvent) => {
       if (isDragging && !isPiP && !isCropping) {
         e.preventDefault();
+        
+        let newX = e.clientX - dragOffsetRef.current.x;
+        let newY = e.clientY - dragOffsetRef.current.y;
+
+        // --- BOUNDARY CONSTRAINTS ---
+        // 1. Top Edge: Prevent header from disappearing above the screen (Keep Y >= 0)
+        if (newY < 0) newY = 0;
+        
+        // 2. Bottom Edge: Keep at least the header visible (approx 60px from bottom)
+        const windowHeight = window.innerHeight;
+        if (newY > windowHeight - 60) newY = windowHeight - 60;
+
+        // 3. Horizontal Edges: Keep largely on screen
+        const windowWidth = window.innerWidth;
+        if (newX < -300) newX = -300; 
+        if (newX > windowWidth - 50) newX = windowWidth - 50;
+
         setPosition({
-          x: e.clientX - dragOffsetRef.current.x,
-          y: e.clientY - dragOffsetRef.current.y
+          x: newX,
+          y: newY
         });
       }
     };
@@ -586,69 +702,80 @@ export const GlassOverlay: React.FC = () => {
     };
   }, [isDragging, isPiP, isCropping]);
 
-  // --- PiP Logic ---
+  // --- PiP Logic (Multi-Screen Support) ---
   const togglePiP = async () => {
     if (isPiP && pipWindowRef.current) {
       pipWindowRef.current.close();
       return;
     }
     if (!('documentPictureInPicture' in window)) {
-      alert("Feature not supported in this browser.");
+      alert("Feature not supported in this browser. Use Chrome or Edge.");
       return;
     }
     try {
+      // Request a new window
       const pipWindow = await (window as any).documentPictureInPicture.requestWindow({
-        width: 450, height: 600,
+        width: 500, 
+        height: 700,
       });
       pipWindowRef.current = pipWindow;
       
-      // Style Sync
+      // Copy styles to ensure the new window looks identical
       [...document.styleSheets].forEach((styleSheet) => {
         try {
           if (styleSheet.href) {
             const link = pipWindow.document.createElement('link');
-            link.rel = 'stylesheet'; link.href = styleSheet.href;
+            link.rel = 'stylesheet';
+            link.type = 'text/css';
+            link.href = styleSheet.href;
             pipWindow.document.head.appendChild(link);
-          } else {
-            const css = [...styleSheet.cssRules].map(r => r.cssText).join('');
-            const style = pipWindow.document.createElement('style');
-            style.textContent = css;
-            pipWindow.document.head.appendChild(style);
+          } else if (styleSheet.cssRules) {
+            const newStyle = pipWindow.document.createElement('style');
+            [...styleSheet.cssRules].forEach(rule => {
+              newStyle.appendChild(pipWindow.document.createTextNode(rule.cssText));
+            });
+            pipWindow.document.head.appendChild(newStyle);
           }
-        } catch (e) {}
+        } catch (e) { console.error(e); }
       });
+
+      // Copy Scripts (specifically for Tailwind CDN if used)
       const scripts = document.querySelectorAll('script');
       scripts.forEach(script => {
-          if (script.src.includes('tailwindcss')) {
+          if (script.src && script.src.includes('tailwindcss')) {
                const newScript = pipWindow.document.createElement('script');
-               newScript.src = script.src; pipWindow.document.head.appendChild(newScript);
+               newScript.src = script.src; 
+               pipWindow.document.head.appendChild(newScript);
           }
       });
-      pipWindow.document.body.className = "bg-black text-white overflow-hidden";
-      pipWindow.addEventListener('pagehide', () => { setIsPiP(false); pipWindowRef.current = null; setIsOpen(true); });
+
+      pipWindow.document.body.className = "bg-black text-white overflow-hidden h-screen w-screen flex flex-col";
+      
+      // Handle window closing logic
+      pipWindow.addEventListener('pagehide', () => { 
+          setIsPiP(false); 
+          pipWindowRef.current = null; 
+          setIsOpen(true); 
+      });
+      
       setIsPiP(true);
     } catch (err) { console.error("PiP failed", err); }
   };
 
   // --- Rendering ---
 
-  if (!isVisible) {
-    return null;
-  }
-
   if (!isOpen && !isPiP) {
-    return (
+     return (
       <button 
         onClick={() => setIsOpen(true)}
-        className="fixed bottom-8 right-8 p-4 bg-black/40 hover:bg-black/60 backdrop-blur-xl border border-white/20 rounded-full shadow-[0_0_20px_rgba(0,0,0,0.5)] text-white transition-all duration-300 hover:scale-110 group z-50"
+        className={`fixed bottom-8 right-8 p-4 bg-black/40 hover:bg-black/60 backdrop-blur-xl border border-white/20 rounded-full shadow-[0_0_20px_rgba(0,0,0,0.5)] text-white transition-all duration-500 hover:scale-110 group z-50 ${!isVisible ? 'opacity-0 pointer-events-none translate-y-10' : 'opacity-100 translate-y-0'}`}
       >
         <Sparkles className="w-6 h-6 group-hover:text-emerald-400 transition-colors animate-pulse" />
       </button>
     );
   }
 
-  // Styles for normal mode vs Cropping mode
-  // In Cropping mode, we maximize the container to viewport to allow full screen selection
+  // Calculate main container styles
   const containerStyle: React.CSSProperties = isPiP 
     ? { width: '100%', height: '100vh', borderRadius: 0, border: 'none' }
     : isCropping
@@ -662,34 +789,50 @@ export const GlassOverlay: React.FC = () => {
     : 'bg-gray-950/30 backdrop-blur-3xl border-white/10 shadow-[0_20px_50px_rgba(0,0,0,0.5)]';
   
   const croppingClasses = isCropping ? 'bg-black/80 cursor-crosshair' : stealthClasses;
+  
+  const visibilityClasses = isVisible 
+    ? 'opacity-100 scale-100 pointer-events-auto' 
+    : 'opacity-0 scale-95 pointer-events-none';
 
   const content = (
     <div 
       ref={overlayRef}
       style={containerStyle}
-      className={`${isPiP ? 'relative' : 'fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2'} 
+      className={`${isPiP ? 'relative h-full w-full' : 'fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2'} 
         ${isPiP || isCropping ? '' : isMinimized ? 'w-[380px] h-[64px]' : 'w-[90vw] h-[80vh] md:w-[500px] md:h-[700px]'} 
         ${isPiP ? 'bg-black' : croppingClasses} 
-        border z-50 flex flex-col ${isCropping ? '' : 'rounded-[32px]'} overflow-hidden transition-all duration-500 ease-out group/overlay`}
+        ${visibilityClasses}
+        border z-50 flex flex-col ${isCropping ? '' : isPiP ? '' : 'rounded-[32px]'} overflow-hidden transition-all duration-500 ease-out group/overlay`}
       onMouseDown={isCropping ? handleCropMouseDown : undefined}
       onMouseMove={isCropping ? handleCropMouseMove : undefined}
       onMouseUp={isCropping ? handleCropMouseUp : undefined}
     >
+      <style>{`
+        @keyframes scan {
+          0% { top: 0%; opacity: 0; }
+          15% { opacity: 1; }
+          85% { opacity: 1; }
+          100% { top: 100%; opacity: 0; }
+        }
+      `}</style>
       
       {/* --- Cropping UI Layer --- */}
       {isCropping && tempScreenshot && (
-        <div className="absolute inset-0 z-50 flex flex-col">
-          {/* Background Screenshot */}
+        <div className="absolute inset-0 z-50 flex flex-col animate-fade-in">
           <img 
             src={tempScreenshot} 
             alt="Screen Capture" 
             className="absolute inset-0 w-full h-full object-contain opacity-60 pointer-events-none select-none"
           />
           
-          {/* Selection Box */}
           {cropRect && (
              <div 
-              className="absolute border-2 border-red-500 bg-white/10 backdrop-contrast-125 shadow-[0_0_0_9999px_rgba(0,0,0,0.5)] pointer-events-none"
+              className={`absolute border-2 transition-colors duration-300
+                ${ocrState === 'success' ? 'border-emerald-500 bg-emerald-500/10' : 
+                  ocrState === 'scanning' ? 'border-indigo-400 bg-indigo-400/10' : 
+                  ocrState === 'error' ? 'border-red-500 bg-red-500/10' :
+                  'border-red-500 bg-white/10'} 
+                backdrop-contrast-125 shadow-[0_0_0_9999px_rgba(0,0,0,0.5)] pointer-events-none`}
               style={{
                 left: cropRect.x,
                 top: cropRect.y,
@@ -697,14 +840,32 @@ export const GlassOverlay: React.FC = () => {
                 height: cropRect.h
               }}
              >
-                <div className="absolute -top-6 left-0 bg-red-500 text-white text-[10px] px-1.5 py-0.5 rounded-t font-bold">
-                  {Math.round(cropRect.w)} x {Math.round(cropRect.h)}
-                </div>
+                {ocrState === 'scanning' && (
+                  <div className="absolute inset-x-0 h-0.5 bg-indigo-400 shadow-[0_0_15px_rgba(129,140,248,1)] animate-[scan_1.5s_linear_infinite]" />
+                )}
+                {ocrState === 'success' && (
+                   <div className="absolute inset-0 flex items-center justify-center animate-fade-in">
+                      <div className="bg-emerald-500 text-white p-3 rounded-full shadow-lg scale-125">
+                         <CheckCircle size={24} />
+                      </div>
+                   </div>
+                )}
+                {ocrState === 'error' && (
+                   <div className="absolute inset-0 flex items-center justify-center animate-fade-in">
+                      <div className="bg-red-500 text-white px-3 py-1 rounded-lg text-sm font-bold shadow-lg">
+                         Error
+                      </div>
+                   </div>
+                )}
+                {ocrState === 'idle' && (
+                  <div className="absolute -top-6 left-0 bg-red-500 text-white text-[10px] px-1.5 py-0.5 rounded-t font-bold">
+                    {Math.round(cropRect.w)} x {Math.round(cropRect.h)}
+                  </div>
+                )}
              </div>
           )}
 
-          {/* Cropping Toolbar */}
-          <div className="absolute bottom-10 left-1/2 -translate-x-1/2 flex items-center gap-4 bg-gray-900 p-2 rounded-full border border-white/20 shadow-2xl pointer-events-auto">
+          <div className={`absolute bottom-10 left-1/2 -translate-x-1/2 flex items-center gap-4 bg-gray-900 p-2 rounded-full border border-white/20 shadow-2xl pointer-events-auto animate-fade-in-up transition-opacity duration-300 ${ocrState !== 'idle' ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}>
              <button 
                onClick={cancelCrop}
                className="p-3 hover:bg-white/10 rounded-full text-white/60 hover:text-white transition-colors"
@@ -712,9 +873,7 @@ export const GlassOverlay: React.FC = () => {
              >
                <X size={20} />
              </button>
-             
              <div className="w-px h-8 bg-white/10" />
-
              <button 
                onClick={() => processCrop('attach')}
                disabled={!cropRect || cropRect.w < 10}
@@ -723,7 +882,6 @@ export const GlassOverlay: React.FC = () => {
                <ImageIcon size={16} />
                <span>Use Image</span>
              </button>
-
              <button 
                onClick={() => processCrop('ocr')}
                disabled={!cropRect || cropRect.w < 10}
@@ -733,17 +891,13 @@ export const GlassOverlay: React.FC = () => {
                <span>Scan Text</span>
              </button>
           </div>
-          
-          <div className="absolute top-10 left-1/2 -translate-x-1/2 px-6 py-2 bg-black/70 backdrop-blur-md rounded-full text-white font-medium border border-white/10 pointer-events-none">
-             Drag to select a region
-          </div>
         </div>
       )}
 
-      {/* --- Header (Hidden while cropping) --- */}
+      {/* --- Header --- */}
       {!isCropping && (
       <div 
-        className={`relative flex items-center justify-between px-5 py-4 select-none group/header ${!isPiP && !isMinimized ? 'cursor-grab active:cursor-grabbing' : ''} transition-colors duration-300 ${isDragging ? 'bg-white/10 border-b border-white/10' : 'bg-gradient-to-b from-white/5 to-transparent'}`}
+        className={`relative flex-none flex items-center justify-between px-5 py-4 select-none group/header ${!isPiP && !isMinimized ? 'cursor-grab active:cursor-grabbing' : ''} transition-colors duration-300 ${isDragging ? 'bg-white/10 border-b border-white/10' : 'bg-gradient-to-b from-white/5 to-transparent'}`}
         onMouseDown={handleMouseDown}
         onDoubleClick={() => !isPiP && setIsMinimized(!isMinimized)}
       >
@@ -757,7 +911,6 @@ export const GlassOverlay: React.FC = () => {
           {isPiP && <div className="w-3 h-3 rounded-full bg-emerald-500 animate-pulse" />}
         </div>
 
-        {/* Drag Indicator + Title */}
         <div className="flex items-center gap-3 pointer-events-none">
           {!isPiP && !isMinimized && (
              <div className={`flex flex-col gap-0.5 p-1 rounded-md transition-opacity duration-300 ${isDragging ? 'opacity-100' : 'opacity-30 group-hover/header:opacity-70'}`}>
@@ -778,10 +931,26 @@ export const GlassOverlay: React.FC = () => {
           <button onClick={() => setIsStealth(!isStealth)} className={`p-1.5 hover:bg-white/10 rounded-full transition-colors ${isStealth ? 'text-indigo-400' : ''}`} title="Toggle Stealth Mode (Alt+S)">
             {isStealth ? <Ghost size={14} /> : <Eye size={14} />}
           </button>
-          <button onClick={() => setShowSettings(!showSettings)} className={`p-1.5 hover:bg-white/10 rounded-full transition-colors ${showSettings ? 'text-white bg-white/10' : ''}`} title="Settings">
+          
+          {/* History Toggle */}
+          <button 
+            onClick={() => { setShowHistory(!showHistory); setShowSettings(false); }} 
+            className={`p-1.5 hover:bg-white/10 rounded-full transition-colors ${showHistory ? 'text-white bg-white/10' : ''}`} 
+            title="Chat History"
+          >
+            <History size={14} />
+          </button>
+
+          {/* Settings Toggle */}
+          <button 
+            onClick={() => { setShowSettings(!showSettings); setShowHistory(false); }} 
+            className={`p-1.5 hover:bg-white/10 rounded-full transition-colors ${showSettings ? 'text-white bg-white/10' : ''}`} 
+            title="Settings"
+          >
             <Settings size={14} />
           </button>
-          <button onClick={togglePiP} className={`p-1.5 hover:bg-white/10 rounded-full transition-colors ${isPiP ? 'text-emerald-400' : ''}`} title="Pop Out"><ExternalLink size={14} /></button>
+
+          <button onClick={togglePiP} className={`p-1.5 hover:bg-white/10 rounded-full transition-colors ${isPiP ? 'text-emerald-400' : ''}`} title="Pop Out (Move to Window)"><ExternalLink size={14} /></button>
           <button onClick={() => setChatState(prev => ({ ...prev, messages: [] }))} className="p-1.5 hover:bg-white/10 rounded-full transition-colors" title="Clear Chat"><RefreshCw size={14} /></button>
           {!isPiP && (
              <button onClick={() => setIsMinimized(!isMinimized)} className="p-1.5 hover:bg-white/10 hover:text-white rounded-full transition-colors">
@@ -792,12 +961,12 @@ export const GlassOverlay: React.FC = () => {
       </div>
       )}
 
-      {/* --- Toolbar (Hidden while cropping) --- */}
-      {!isMinimized && !showSettings && !isCropping && (
-        <div className={`px-4 py-2 flex items-center gap-2 bg-white/5 border-b border-white/5 backdrop-blur-sm overflow-x-auto scrollbar-hide transition-opacity duration-300 ${isStealth ? 'opacity-0 group-hover/overlay:opacity-100' : 'opacity-100'}`}>
+      {/* --- Toolbar --- */}
+      {!isMinimized && !showSettings && !showHistory && !isCropping && (
+        <div className={`flex-none px-4 py-2 flex items-center gap-2 bg-white/5 border-b border-white/5 backdrop-blur-sm overflow-x-auto scrollbar-hide transition-opacity duration-300 ${isStealth ? 'opacity-0 group-hover/overlay:opacity-100' : 'opacity-100'}`}>
            <button
             onClick={() => setChatState(prev => ({...prev, config: {...prev.config, useThinking: !prev.config.useThinking}}))}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-all ${chatState.config.useThinking ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30' : 'bg-white/5 text-white/40 border border-transparent hover:bg-white/10'}`}
+            className={`flex-none flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-all ${chatState.config.useThinking ? 'bg-indigo-500/20 text-indigo-300 border border-indigo-500/30' : 'bg-white/5 text-white/40 border border-transparent hover:bg-white/10'}`}
            >
              <BrainCircuit size={12} />
              <span>Deep Think</span>
@@ -805,24 +974,23 @@ export const GlassOverlay: React.FC = () => {
            
            <button
             onClick={() => setChatState(prev => ({...prev, config: {...prev.config, useSearch: !prev.config.useSearch}}))}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-all ${chatState.config.useSearch ? 'bg-blue-500/20 text-blue-300 border border-blue-500/30' : 'bg-white/5 text-white/40 border border-transparent hover:bg-white/10'}`}
+            className={`flex-none flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-all ${chatState.config.useSearch ? 'bg-blue-500/20 text-blue-300 border border-blue-500/30' : 'bg-white/5 text-white/40 border border-transparent hover:bg-white/10'}`}
            >
              <Globe size={12} />
              <span>Search</span>
            </button>
 
            <button
-            onClick={toggleScreenShare}
-            className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-all ${isScreenShared ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 animate-pulse' : 'bg-white/5 text-white/40 border border-transparent hover:bg-white/10'}`}
+            onClick={() => toggleScreenShare()}
+            className={`flex-none flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-all ${isScreenShared ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 animate-pulse' : 'bg-white/5 text-white/40 border border-transparent hover:bg-white/10'}`}
            >
              {isScreenShared ? <Monitor size={12} /> : <Eye size={12} />}
              <span>{isScreenShared ? 'Watching' : 'Watch Screen'}</span>
            </button>
 
-           {/* New Capture Button */}
            <button
              onClick={startRegionCapture}
-             className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-all bg-white/5 text-white/40 border border-transparent hover:bg-white/10 hover:text-pink-300"
+             className="flex-none flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-all bg-white/5 text-white/40 border border-transparent hover:bg-white/10 hover:text-pink-300"
              title="Snipping Tool"
            >
              <Crop size={12} />
@@ -831,82 +999,231 @@ export const GlassOverlay: React.FC = () => {
         </div>
       )}
 
-      {/* --- Settings View --- */}
-      {showSettings && !isMinimized && !isCropping && (
-        <div className="flex-1 flex flex-col bg-gray-950/80 backdrop-blur-xl p-6 overflow-y-auto animate-fade-in custom-scrollbar">
-           <div className="flex items-center gap-3 mb-6 text-white/80">
-              <button onClick={() => setShowSettings(false)} className="p-2 rounded-full hover:bg-white/10"><ChevronLeft size={18}/></button>
-              <h2 className="text-lg font-semibold">Model Configuration</h2>
+      {/* --- History View --- */}
+      {showHistory && !isMinimized && !isCropping && (
+        <div className="flex-1 flex flex-col bg-gray-950/80 backdrop-blur-xl p-0 overflow-hidden animate-fade-in">
+           <div className="flex-none flex items-center justify-between p-6 pb-4 text-white/90 border-b border-white/10 bg-white/5">
+              <div className="flex items-center gap-3">
+                <button onClick={() => setShowHistory(false)} className="p-2 rounded-full hover:bg-white/10 transition-colors"><ChevronLeft size={18}/></button>
+                <div>
+                  <h2 className="text-lg font-semibold tracking-tight">History</h2>
+                  <p className="text-xs text-white/40">Saved conversations</p>
+                </div>
+              </div>
+              <button 
+                onClick={handleSaveSession}
+                disabled={chatState.messages.length <= 1}
+                className="flex items-center gap-2 px-3 py-1.5 bg-white/10 hover:bg-white/20 disabled:opacity-50 disabled:hover:bg-white/10 rounded-lg text-xs font-medium transition-colors"
+              >
+                <Archive size={14} />
+                <span>Save Current</span>
+              </button>
            </div>
 
-           <div className="space-y-6">
-             {/* Model Select */}
-             <div className="space-y-2">
-               <label className="text-xs font-medium text-white/50 uppercase tracking-wider">Model Selection</label>
-               <div className="grid gap-2">
-                  <button 
-                    onClick={() => setChatState(prev => ({...prev, config: {...prev.config, model: ModelType.FLASH}}))}
-                    className={`flex items-center justify-between p-4 rounded-xl border transition-all ${chatState.config.model === ModelType.FLASH ? 'bg-emerald-500/10 border-emerald-500/50 text-emerald-400' : 'bg-white/5 border-white/10 text-white/60 hover:bg-white/10'}`}
-                  >
-                     <div className="text-left">
-                       <div className="font-medium text-sm">Gemini 2.5 Flash</div>
-                       <div className="text-xs opacity-60 mt-0.5">Fast, efficient, multimodal</div>
-                     </div>
-                     {chatState.config.model === ModelType.FLASH && <div className="w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.5)]"/>}
-                  </button>
-
-                  <button 
-                    onClick={() => setChatState(prev => ({...prev, config: {...prev.config, model: ModelType.PRO}}))}
-                    className={`flex items-center justify-between p-4 rounded-xl border transition-all ${chatState.config.model === ModelType.PRO ? 'bg-indigo-500/10 border-indigo-500/50 text-indigo-400' : 'bg-white/5 border-white/10 text-white/60 hover:bg-white/10'}`}
-                  >
-                     <div className="text-left">
-                       <div className="font-medium text-sm">Gemini 3 Pro Preview</div>
-                       <div className="text-xs opacity-60 mt-0.5">High reasoning, complex tasks</div>
-                     </div>
-                     {chatState.config.model === ModelType.PRO && <div className="w-2 h-2 rounded-full bg-indigo-400 shadow-[0_0_10px_rgba(129,140,248,0.5)]"/>}
-                  </button>
-               </div>
-             </div>
-
-             {/* Temperature */}
-             <div className="space-y-3">
-                <div className="flex justify-between items-center">
-                  <label className="text-xs font-medium text-white/50 uppercase tracking-wider">Creativity (Temperature)</label>
-                  <span className="text-xs font-mono text-white/80">{chatState.config.temperature.toFixed(1)}</span>
+           <div className="flex-1 overflow-y-auto p-4 space-y-3 custom-scrollbar">
+             {sessions.length === 0 && (
+                <div className="flex flex-col items-center justify-center h-40 text-white/30">
+                   <History size={32} className="mb-2 opacity-50" />
+                   <span className="text-sm">No saved sessions yet</span>
                 </div>
-                <input 
-                  type="range" 
-                  min="0" 
-                  max="2" 
-                  step="0.1"
-                  value={chatState.config.temperature}
-                  onChange={(e) => setChatState(prev => ({...prev, config: {...prev.config, temperature: parseFloat(e.target.value)}}))}
-                  className="w-full h-1.5 bg-white/10 rounded-full appearance-none cursor-pointer accent-emerald-500"
-                />
-                <div className="flex justify-between text-[10px] text-white/30">
-                  <span>Precise</span>
-                  <span>Balanced</span>
-                  <span>Creative</span>
+             )}
+             
+             {sessions.map((session) => (
+                <div key={session.id} className="group flex items-center justify-between p-4 bg-white/5 hover:bg-white/10 border border-white/5 rounded-xl transition-all">
+                   <button onClick={() => handleLoadSession(session)} className="flex-1 text-left overflow-hidden">
+                      <div className="font-medium text-sm text-white/90 truncate">{session.title}</div>
+                      <div className="flex items-center gap-2 mt-1 text-xs text-white/40">
+                         <Clock size={10} />
+                         <span>{new Date(session.timestamp).toLocaleDateString()}</span>
+                         <span>•</span>
+                         <span>{new Date(session.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span>
+                         <span>•</span>
+                         <span>{session.messages.length} msgs</span>
+                      </div>
+                   </button>
+                   <button 
+                     onClick={(e) => handleDeleteSession(e, session.id)} 
+                     className="p-2 text-white/20 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors opacity-0 group-hover:opacity-100"
+                     title="Delete Session"
+                   >
+                      <Trash2 size={16} />
+                   </button>
                 </div>
-             </div>
-
-             {/* System Instructions */}
-             <div className="space-y-2">
-               <label className="text-xs font-medium text-white/50 uppercase tracking-wider">System Instructions (Persona)</label>
-               <textarea 
-                 value={chatState.config.systemInstruction}
-                 onChange={(e) => setChatState(prev => ({...prev, config: {...prev.config, systemInstruction: e.target.value}}))}
-                 className="w-full h-32 bg-black/20 border border-white/10 rounded-xl p-3 text-sm text-white/80 focus:border-emerald-500/50 outline-none resize-none custom-scrollbar"
-                 placeholder="Define how the AI should behave..."
-               />
-             </div>
+             ))}
            </div>
         </div>
       )}
 
-      {/* --- Chat Area (Hidden while cropping) --- */}
-      <div className={`flex-1 flex flex-col overflow-hidden transition-opacity duration-300 ${isMinimized && !isPiP ? 'opacity-0' : 'opacity-100'} ${showSettings || isCropping ? 'hidden' : 'flex'}`}>
-        <div className={`flex-1 overflow-y-auto p-5 space-y-6 custom-scrollbar scroll-smooth ${isStealth ? 'opacity-20 group-hover/overlay:opacity-100 transition-opacity duration-500' : ''}`}>
+      {/* --- Settings View --- */}
+      {showSettings && !isMinimized && !isCropping && (
+        <div className="flex-1 flex flex-col bg-gray-950/80 backdrop-blur-xl p-0 overflow-hidden animate-fade-in">
+           <div className="flex-none flex items-center gap-3 p-6 pb-4 text-white/90 border-b border-white/10 bg-white/5">
+              <button onClick={() => setShowSettings(false)} className="p-2 rounded-full hover:bg-white/10 transition-colors"><ChevronLeft size={18}/></button>
+              <div>
+                <h2 className="text-lg font-semibold tracking-tight">Settings</h2>
+                <p className="text-xs text-white/40">Customize your AI experience</p>
+              </div>
+           </div>
+
+           <div className="flex-1 overflow-y-auto p-4 space-y-3 custom-scrollbar">
+             
+             {/* Section 1: Intelligence & Model */}
+             <SettingsSection 
+                id="model" 
+                title="Intelligence & Model" 
+                icon={Cpu}
+                activeSection={activeSettingsSection}
+                onToggle={setActiveSettingsSection}
+             >
+               <div className="grid gap-3">
+                  {/* Flash */}
+                  <button 
+                    onClick={() => setChatState(prev => ({...prev, config: {...prev.config, model: ModelType.FLASH}}))}
+                    className={`group flex items-center justify-between p-4 rounded-xl border transition-all ${chatState.config.model === ModelType.FLASH ? 'bg-emerald-500/10 border-emerald-500/50 text-emerald-400' : 'bg-white/5 border-white/10 text-white/60 hover:bg-white/10'}`}
+                  >
+                     <div className="text-left">
+                       <div className="font-medium text-sm flex items-center gap-2">
+                         Gemini 2.5 Flash
+                         {chatState.config.model === ModelType.FLASH && <Check size={14} />}
+                       </div>
+                       <div className="text-xs opacity-60 mt-1">Fast, efficient, and lightweight. Best for quick tasks.</div>
+                     </div>
+                  </button>
+
+                  {/* Pro */}
+                  <button 
+                    onClick={() => setChatState(prev => ({...prev, config: {...prev.config, model: ModelType.PRO}}))}
+                    className={`group flex items-center justify-between p-4 rounded-xl border transition-all ${chatState.config.model === ModelType.PRO ? 'bg-indigo-500/10 border-indigo-500/50 text-indigo-400' : 'bg-white/5 border-white/10 text-white/60 hover:bg-white/10'}`}
+                  >
+                     <div className="text-left">
+                       <div className="font-medium text-sm flex items-center gap-2">
+                         Gemini 3 Pro Preview
+                         {chatState.config.model === ModelType.PRO && <Check size={14} />}
+                       </div>
+                       <div className="text-xs opacity-60 mt-1">Advanced reasoning for complex problems and coding.</div>
+                     </div>
+                  </button>
+                  
+                  {/* Deep Think Toggle */}
+                  <div className="flex items-center justify-between p-3 bg-white/5 rounded-xl border border-white/5">
+                     <div className="flex items-center gap-3">
+                        <div className="p-2 bg-indigo-500/20 rounded-lg text-indigo-300"><BrainCircuit size={16}/></div>
+                        <div className="flex flex-col">
+                           <span className="text-sm font-medium text-white/80">Deep Think</span>
+                           <span className="text-[10px] text-white/40">Enable extended reasoning time</span>
+                        </div>
+                     </div>
+                     <button 
+                       onClick={() => setChatState(prev => ({...prev, config: {...prev.config, useThinking: !prev.config.useThinking}}))}
+                       className={`w-10 h-5 rounded-full transition-colors relative ${chatState.config.useThinking ? 'bg-indigo-500' : 'bg-white/10'}`}
+                     >
+                        <div className={`absolute top-1 bottom-1 w-3 h-3 bg-white rounded-full transition-transform duration-300 ${chatState.config.useThinking ? 'left-6' : 'left-1'}`} />
+                     </button>
+                  </div>
+               </div>
+             </SettingsSection>
+
+             {/* Section 2: Tools & Capabilities */}
+             <SettingsSection 
+                id="tools" 
+                title="Tools & Capabilities" 
+                icon={Wrench}
+                activeSection={activeSettingsSection}
+                onToggle={setActiveSettingsSection}
+             >
+                <div className="grid grid-cols-2 gap-3">
+                    <button 
+                      onClick={() => setChatState(prev => ({...prev, config: {...prev.config, useSearch: !prev.config.useSearch}}))}
+                      className={`relative overflow-hidden flex flex-col items-center gap-3 p-4 rounded-xl border transition-all ${chatState.config.useSearch ? 'bg-blue-500/10 border-blue-500/40 text-blue-400' : 'bg-white/5 border-white/10 text-white/40 hover:bg-white/10'}`}
+                    >
+                       <div className={`p-3 rounded-full transition-colors ${chatState.config.useSearch ? 'bg-blue-500/20' : 'bg-white/5'}`}>
+                          <Globe size={20} />
+                       </div>
+                       <div className="text-center">
+                         <div className="text-xs font-bold uppercase tracking-wider">Google Search</div>
+                         <div className="text-[10px] opacity-60 mt-1">Access real-time web data</div>
+                       </div>
+                       {chatState.config.useSearch && <div className="absolute inset-x-0 bottom-0 h-0.5 bg-blue-500 shadow-[0_0_10px_rgba(59,130,246,1)]" />}
+                    </button>
+
+                    <button 
+                      onClick={() => setChatState(prev => ({...prev, config: {...prev.config, useMaps: !prev.config.useMaps}}))}
+                      className={`relative overflow-hidden flex flex-col items-center gap-3 p-4 rounded-xl border transition-all ${chatState.config.useMaps ? 'bg-green-500/10 border-green-500/40 text-green-400' : 'bg-white/5 border-white/10 text-white/40 hover:bg-white/10'}`}
+                    >
+                       <div className={`p-3 rounded-full transition-colors ${chatState.config.useMaps ? 'bg-green-500/20' : 'bg-white/5'}`}>
+                          <MapPin size={20} />
+                       </div>
+                       <div className="text-center">
+                         <div className="text-xs font-bold uppercase tracking-wider">Google Maps</div>
+                         <div className="text-[10px] opacity-60 mt-1">Location & place data</div>
+                       </div>
+                       {chatState.config.useMaps && <div className="absolute inset-x-0 bottom-0 h-0.5 bg-green-500 shadow-[0_0_10px_rgba(34,197,94,1)]" />}
+                    </button>
+                </div>
+             </SettingsSection>
+
+             {/* Section 3: Persona & Creativity */}
+             <SettingsSection 
+                id="creativity" 
+                title="Personality & Creativity" 
+                icon={Palette}
+                activeSection={activeSettingsSection}
+                onToggle={setActiveSettingsSection}
+             >
+                <div className="space-y-6">
+                   {/* Temperature */}
+                   <div className="space-y-3">
+                      <div className="flex justify-between items-center">
+                        <div className="flex items-center gap-2 text-xs font-medium text-white/60 uppercase tracking-wider">
+                           <Sliders size={12} />
+                           Temperature
+                        </div>
+                        <span className="text-xs font-mono bg-white/10 px-2 py-0.5 rounded text-white/80">{chatState.config.temperature.toFixed(1)}</span>
+                      </div>
+                      <div className="relative h-6 flex items-center">
+                        <input 
+                          type="range" 
+                          min="0" 
+                          max="2" 
+                          step="0.1"
+                          value={chatState.config.temperature}
+                          onChange={(e) => setChatState(prev => ({...prev, config: {...prev.config, temperature: parseFloat(e.target.value)}}))}
+                          className="absolute w-full h-1.5 bg-white/10 rounded-full appearance-none cursor-pointer accent-emerald-500 z-10"
+                        />
+                        <div className="absolute inset-x-0 h-1.5 rounded-full overflow-hidden pointer-events-none">
+                           <div className="h-full bg-gradient-to-r from-blue-500 via-emerald-500 to-orange-500 opacity-30" />
+                        </div>
+                      </div>
+                      <div className="flex justify-between text-[9px] text-white/30 uppercase font-bold tracking-widest">
+                        <span>Precise</span>
+                        <span>Balanced</span>
+                        <span>Creative</span>
+                      </div>
+                   </div>
+
+                   {/* System Instructions */}
+                   <div className="space-y-2">
+                     <div className="flex items-center gap-2 text-xs font-medium text-white/60 uppercase tracking-wider">
+                        <MessageSquare size={12} />
+                        System Persona
+                     </div>
+                     <textarea 
+                       value={chatState.config.systemInstruction}
+                       onChange={(e) => setChatState(prev => ({...prev, config: {...prev.config, systemInstruction: e.target.value}}))}
+                       className="w-full h-32 bg-black/20 border border-white/10 rounded-xl p-3 text-sm text-white/80 focus:border-emerald-500/50 focus:bg-black/40 outline-none resize-none custom-scrollbar transition-all"
+                       placeholder="You are a helpful assistant..."
+                     />
+                     <p className="text-[10px] text-white/30">Define how the AI should behave, its tone, and its specific role.</p>
+                   </div>
+                </div>
+             </SettingsSection>
+           </div>
+        </div>
+      )}
+
+      {/* --- Chat Area --- */}
+      <div className={`flex-1 flex flex-col overflow-hidden transition-opacity duration-300 ${isMinimized && !isPiP ? 'opacity-0' : 'opacity-100'} ${showSettings || showHistory || isCropping ? 'hidden' : 'flex'}`}>
+        <div className={`flex-1 overflow-y-auto p-4 md:p-5 space-y-4 md:space-y-6 custom-scrollbar scroll-smooth ${isStealth ? 'opacity-20 group-hover/overlay:opacity-100 transition-opacity duration-500' : ''}`}>
           {chatState.messages.map((msg) => (
             <MessageBubble key={msg.id} message={msg} />
           ))}
@@ -919,7 +1236,7 @@ export const GlassOverlay: React.FC = () => {
         </div>
 
         {/* --- Input Area --- */}
-        <div className={`p-4 bg-gradient-to-t from-black/40 to-transparent pt-8 transition-opacity duration-300 ${isStealth ? 'opacity-0 group-hover/overlay:opacity-100' : 'opacity-100'}`}>
+        <div className={`flex-none p-4 bg-gradient-to-t from-black/40 to-transparent pt-4 transition-opacity duration-300 ${isStealth ? 'opacity-0 group-hover/overlay:opacity-100' : 'opacity-100'}`}>
            
            {/* Attached Image Preview */}
            {attachedImage && (
@@ -933,7 +1250,11 @@ export const GlassOverlay: React.FC = () => {
              </div>
            )}
 
-           <div className={`relative flex items-center gap-2 bg-gray-900/60 backdrop-blur-xl rounded-[24px] border border-white/10 px-2 py-1 focus-within:border-white/20 focus-within:bg-gray-900/80 transition-all duration-300 shadow-lg ${!isOnline ? 'opacity-50' : ''}`}>
+           <div className={`relative flex items-center gap-2 bg-gray-900/60 backdrop-blur-xl rounded-[24px] border transition-all duration-500 shadow-lg px-2 py-1 
+             ${inputHighlight 
+                ? 'border-emerald-500 shadow-[0_0_30px_rgba(16,185,129,0.3)] bg-emerald-950/30' 
+                : 'border-white/10 focus-within:border-white/20 focus-within:bg-gray-900/80'} 
+             ${!isOnline ? 'opacity-50' : ''}`}>
               
               {/* Mic Button */}
               <button 
@@ -950,14 +1271,14 @@ export const GlassOverlay: React.FC = () => {
                 onChange={(e) => setInputText(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
                 placeholder={isRecording ? "Listening..." : isScreenShared ? "Ask about this..." : attachedImage ? "Ask about this region..." : "Type a message..."}
-                className="flex-1 bg-transparent text-white placeholder-white/30 px-2 py-3 outline-none font-light"
+                className="flex-1 bg-transparent text-white placeholder-white/30 px-2 py-3 outline-none font-light min-w-0"
                 disabled={chatState.isLoading || !isOnline}
               />
 
               <button
                 onClick={handleSendMessage}
                 disabled={(!inputText.trim() && !isScreenShared && !attachedImage) || chatState.isLoading}
-                className={`p-3 rounded-[20px] transition-all duration-300 ${
+                className={`p-3 rounded-[20px] transition-all duration-300 flex-shrink-0 ${
                    (inputText.trim() || isScreenShared || attachedImage) && !chatState.isLoading
                     ? 'bg-white text-black shadow-[0_0_20px_rgba(255,255,255,0.3)] hover:scale-105 active:scale-95'
                     : 'bg-white/5 text-white/20 cursor-not-allowed'

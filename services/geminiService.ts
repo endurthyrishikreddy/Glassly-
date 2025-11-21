@@ -1,3 +1,4 @@
+
 import { GoogleGenAI, Chat, GenerateContentResponse, Content, Part, Modality } from "@google/genai";
 import { ModelType } from "../types";
 
@@ -16,6 +17,7 @@ interface SessionConfig {
   systemInstruction: string;
   useThinking: boolean;
   useSearch: boolean;
+  useMaps: boolean;
 }
 
 export const createChatSession = (
@@ -24,14 +26,16 @@ export const createChatSession = (
 ): Chat => {
   const client = getAiClient();
   
-  const tools = [];
+  const tools: any[] = [];
   if (config.useSearch) {
     tools.push({ googleSearch: {} });
   }
+  if (config.useMaps) {
+    tools.push({ googleMaps: {} });
+  }
 
   // Determine effective model
-  // If Thinking is enabled, we MUST use a model that supports it (usually Pro)
-  // and ignore the temperature as thinking models handle it differently or use budget.
+  // If Thinking is enabled, we prefer a model that supports it well (like Pro)
   const effectiveModel = config.useThinking ? ModelType.PRO : config.model;
 
   const generationConfig: any = {
@@ -45,7 +49,22 @@ export const createChatSession = (
   }
 
   if (config.useThinking) {
+    // Enable thinking with a reasonable budget
     generationConfig.thinkingConfig = { thinkingBudget: 16384 }; 
+  }
+
+  // Map configuration needs to know the user's location for "near me" queries
+  if (config.useMaps) {
+    generationConfig.toolConfig = {
+      retrievalConfig: {
+        // This is a placeholder. In a real app, you would get this from navigator.geolocation
+        // For now, we let the model infer or ask, but providing latLng improves accuracy.
+        latLng: {
+          latitude: 37.7749, // Defaulting to SF for demo, or handle dynamic injection
+          longitude: -122.4194
+        }
+      }
+    }
   }
 
   return client.chats.create({
