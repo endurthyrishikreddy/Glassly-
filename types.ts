@@ -16,6 +16,10 @@ export interface ChatState {
     useSearch: boolean;
     useThinking: boolean;
     isScreenActive: boolean;
+    // Model Configuration
+    model: string;
+    temperature: number;
+    systemInstruction: string;
   };
 }
 

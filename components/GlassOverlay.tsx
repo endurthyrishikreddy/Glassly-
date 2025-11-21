@@ -3,10 +3,10 @@ import { createPortal } from 'react-dom';
 import { 
   Send, Sparkles, RefreshCw, Minimize2, Maximize2, ExternalLink, 
   WifiOff, Wifi, Eye, X, Mic, BrainCircuit, Globe, Monitor, GripHorizontal,
-  Ghost, EyeOff
+  Ghost, EyeOff, Settings, ChevronLeft, Save, Crop, ScanLine, Check, Image as ImageIcon
 } from 'lucide-react';
 import { Message, ChatState, ModelType } from '../types';
-import { createChatSession, sendMessageStream, transcribeAudio } from '../services/geminiService';
+import { createChatSession, sendMessageStream, transcribeAudio, extractTextFromImage } from '../services/geminiService';
 import { MessageBubble } from './MessageBubble';
 import { Chat, Content } from "@google/genai";
 
@@ -19,11 +19,18 @@ declare var ImageCapture: {
   new (track: MediaStreamTrack): ImageCapture;
 };
 
-const STORAGE_KEY = 'gemini_glass_overlay_history_v2';
+const STORAGE_KEY = 'gemini_glass_overlay_history_v3';
 
 interface ScreenshotData {
   data: string; // base64
   mimeType: string;
+}
+
+interface Rect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
 }
 
 export const GlassOverlay: React.FC = () => {
@@ -39,6 +46,15 @@ export const GlassOverlay: React.FC = () => {
   // Stealth & Visibility
   const [isStealth, setIsStealth] = useState(false); // Low opacity mode
   const [isVisible, setIsVisible] = useState(true);  // Fully hidden/shown toggle
+  const [showSettings, setShowSettings] = useState(false); // Settings View Toggle
+
+  // Cropping / Snipping Tool State
+  const [isCropping, setIsCropping] = useState(false);
+  const [tempScreenshot, setTempScreenshot] = useState<string | null>(null);
+  const [cropRect, setCropRect] = useState<Rect | null>(null);
+  const [isDrawingCrop, setIsDrawingCrop] = useState(false);
+  const [cropStart, setCropStart] = useState<{x: number, y: number} | null>(null);
+  const [attachedImage, setAttachedImage] = useState<ScreenshotData | null>(null);
 
   // PiP State
   const [isPiP, setIsPiP] = useState(false);
@@ -51,11 +67,20 @@ export const GlassOverlay: React.FC = () => {
       if (saved) {
         try {
           const parsed = JSON.parse(saved);
+          // Migration for old configs
+          const config = parsed.config || {};
           return {
             messages: parsed.messages || [],
             isLoading: false,
             error: null,
-            config: parsed.config || { useSearch: false, useThinking: false, isScreenActive: false }
+            config: {
+              useSearch: config.useSearch || false,
+              useThinking: config.useThinking || false,
+              isScreenActive: false,
+              model: config.model || ModelType.FLASH,
+              temperature: config.temperature !== undefined ? config.temperature : 0.7,
+              systemInstruction: config.systemInstruction || "You are a helpful, concise AI assistant living in a transparent glass overlay. Keep answers brief and relevant."
+            }
           };
         } catch (e) { console.error(e); }
       }
@@ -69,7 +94,14 @@ export const GlassOverlay: React.FC = () => {
       }],
       isLoading: false,
       error: null,
-      config: { useSearch: false, useThinking: false, isScreenActive: false }
+      config: { 
+        useSearch: false, 
+        useThinking: false, 
+        isScreenActive: false,
+        model: ModelType.FLASH,
+        temperature: 0.7,
+        systemInstruction: "You are a helpful, concise AI assistant living in a transparent glass overlay. Keep answers brief and relevant."
+      }
     };
   });
 
@@ -91,11 +123,9 @@ export const GlassOverlay: React.FC = () => {
   // Keyboard Shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      // Alt + H to toggle visibility (Ghost Mode)
       if (e.altKey && (e.key === 'h' || e.key === 'H')) {
         setIsVisible(prev => !prev);
       }
-      // Alt + S to toggle stealth (Transparency)
       if (e.altKey && (e.key === 's' || e.key === 'S')) {
         setIsStealth(prev => !prev);
       }
@@ -131,18 +161,18 @@ export const GlassOverlay: React.FC = () => {
       parts: [{ text: msg.text }]
     }));
     
-    // Determine model: Pro if thinking is on, otherwise Flash
-    // We will dynamically switch to Pro for Vision in handleSendMessage if needed
-    const model = chatState.config.useThinking ? ModelType.PRO : ModelType.FLASH;
-    
+    // The service handles logic to upgrade model if thinking is true
     chatSessionRef.current = createChatSession(
-      model,
-      undefined,
-      history,
-      chatState.config.useThinking,
-      chatState.config.useSearch
+      {
+        model: chatState.config.model,
+        temperature: chatState.config.temperature,
+        systemInstruction: chatState.config.systemInstruction,
+        useThinking: chatState.config.useThinking,
+        useSearch: chatState.config.useSearch
+      },
+      history
     );
-  }, [chatState.messages, chatState.config.useThinking, chatState.config.useSearch]);
+  }, [chatState.messages, chatState.config]);
 
   // Initial Load
   useEffect(() => {
@@ -154,8 +184,8 @@ export const GlassOverlay: React.FC = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
   };
   useEffect(() => {
-    if (!isMinimized && isVisible) scrollToBottom();
-  }, [chatState.messages, isOpen, isMinimized, isPiP, isVisible]);
+    if (!isMinimized && isVisible && !showSettings && !isCropping) scrollToBottom();
+  }, [chatState.messages, isOpen, isMinimized, isPiP, isVisible, showSettings, isCropping]);
 
   // --- Features ---
 
@@ -166,6 +196,7 @@ export const GlassOverlay: React.FC = () => {
       mediaStream?.getTracks().forEach(track => track.stop());
       setMediaStream(null);
       setIsScreenShared(false);
+      if (isCropping) cancelCrop();
     } else {
       try {
         const stream = await navigator.mediaDevices.getDisplayMedia({
@@ -176,12 +207,17 @@ export const GlassOverlay: React.FC = () => {
         stream.getVideoTracks()[0].onended = () => {
           setIsScreenShared(false);
           setMediaStream(null);
+          if (isCropping) cancelCrop();
         };
 
         setMediaStream(stream);
         setIsScreenShared(true);
       } catch (err) {
         console.error("Screen share cancelled", err);
+        // If user cancelled, we don't error. If permission failed, we might show an alert.
+        if (err instanceof DOMException && err.name !== 'NotAllowedError') {
+            setChatState(prev => ({...prev, error: "Screen sharing failed. Please check permissions."}));
+        }
       }
     }
   };
@@ -191,7 +227,11 @@ export const GlassOverlay: React.FC = () => {
     
     // Smart Capture: Briefly hide the overlay so we don't block the content
     const wasVisible = isVisible;
-    if (wasVisible && !isPiP) {
+    const wasCropping = isCropping; 
+
+    // If we are already in cropping mode, we are displaying a static image, 
+    // so we don't need to hide/unhide. But if we are capturing FOR the crop mode:
+    if (wasVisible && !isPiP && !wasCropping) {
        setIsVisible(false);
        // Wait for render cycle to hide DOM
        await new Promise(resolve => setTimeout(resolve, 250));
@@ -211,7 +251,7 @@ export const GlassOverlay: React.FC = () => {
         const base64Url = canvas.toDataURL('image/jpeg', 0.8);
         
         // Restore visibility
-        if (wasVisible && !isPiP) setIsVisible(true);
+        if (wasVisible && !isPiP && !wasCropping) setIsVisible(true);
         
         return {
           data: base64Url.split(',')[1],
@@ -220,9 +260,148 @@ export const GlassOverlay: React.FC = () => {
       }
     } catch (e) {
       console.error("Capture failed", e);
-      if (wasVisible && !isPiP) setIsVisible(true);
+      if (wasVisible && !isPiP && !wasCropping) setIsVisible(true);
     }
     return null;
+  };
+
+  // --- Crop / Region Capture Logic ---
+  
+  const startRegionCapture = async () => {
+    if (!mediaStream) {
+      await toggleScreenShare();
+      // If user cancelled the share, mediaStream will still be null (due to state update lag or rejection)
+      // We can check if we are shared in a slight timeout or return if isScreenShared is false
+      // But since toggleScreenShare is async, we can check after await.
+      // Ideally, we can't immediately capture after setting stream state due to React rendering.
+      // So we might need a second click or use a ref/effect.
+      // For simplicity: prompt user to share first if not shared.
+    }
+    
+    // We need the stream active to capture
+    if (!mediaStream && !isScreenShared) {
+        // Wait for next cycle or user interaction
+        return; 
+    }
+    
+    // Small delay to allow stream to spin up if just started
+    await new Promise(r => setTimeout(r, 500));
+
+    // Take the full screenshot
+    const screenShot = await captureFrame();
+    if (screenShot) {
+      setTempScreenshot(`data:${screenShot.mimeType};base64,${screenShot.data}`);
+      setIsCropping(true);
+      setCropRect(null);
+    }
+  };
+
+  const cancelCrop = () => {
+    setIsCropping(false);
+    setTempScreenshot(null);
+    setCropRect(null);
+  };
+
+  const handleCropMouseDown = (e: React.MouseEvent) => {
+    if (!isCropping) return;
+    e.preventDefault();
+    setIsDrawingCrop(true);
+    const bounds = overlayRef.current?.getBoundingClientRect();
+    if (!bounds) return;
+    
+    const x = e.clientX - bounds.left;
+    const y = e.clientY - bounds.top;
+    setCropStart({ x, y });
+    setCropRect({ x, y, w: 0, h: 0 });
+  };
+
+  const handleCropMouseMove = (e: React.MouseEvent) => {
+    if (!isDrawingCrop || !cropStart) return;
+    const bounds = overlayRef.current?.getBoundingClientRect();
+    if (!bounds) return;
+
+    const currentX = e.clientX - bounds.left;
+    const currentY = e.clientY - bounds.top;
+
+    const x = Math.min(currentX, cropStart.x);
+    const y = Math.min(currentY, cropStart.y);
+    const w = Math.abs(currentX - cropStart.x);
+    const h = Math.abs(currentY - cropStart.y);
+
+    setCropRect({ x, y, w, h });
+  };
+
+  const handleCropMouseUp = () => {
+    setIsDrawingCrop(false);
+  };
+
+  const processCrop = async (mode: 'attach' | 'ocr') => {
+    if (!tempScreenshot || !cropRect || cropRect.w < 10 || cropRect.h < 10) return;
+
+    const img = new Image();
+    img.src = tempScreenshot;
+    await new Promise(r => img.onload = r);
+
+    const canvas = document.createElement('canvas');
+    
+    // We need to map the DOM coordinates (cropRect) to the actual Image dimensions
+    // Since the image is "object-contain" in full screen, we need to calculate ratio
+    const containerW = overlayRef.current?.clientWidth || 1;
+    const containerH = overlayRef.current?.clientHeight || 1;
+    
+    // The image is displayed using object-contain. 
+    // We need to determine the actual rendered dimensions of the image.
+    const imgRatio = img.width / img.height;
+    const containerRatio = containerW / containerH;
+    
+    let renderW, renderH, offsetX, offsetY;
+    
+    if (containerRatio > imgRatio) {
+       renderH = containerH;
+       renderW = renderH * imgRatio;
+       offsetX = (containerW - renderW) / 2;
+       offsetY = 0;
+    } else {
+       renderW = containerW;
+       renderH = renderW / imgRatio;
+       offsetX = 0;
+       offsetY = (containerH - renderH) / 2;
+    }
+
+    // Map mouse coordinates to image coordinates
+    const scaleX = img.width / renderW;
+    const scaleY = img.height / renderH;
+
+    const actualX = (cropRect.x - offsetX) * scaleX;
+    const actualY = (cropRect.y - offsetY) * scaleY;
+    const actualW = cropRect.w * scaleX;
+    const actualH = cropRect.h * scaleY;
+
+    canvas.width = actualW;
+    canvas.height = actualH;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.drawImage(img, actualX, actualY, actualW, actualH, 0, 0, actualW, actualH);
+    
+    const croppedBase64 = canvas.toDataURL('image/jpeg').split(',')[1];
+
+    if (mode === 'attach') {
+      setAttachedImage({ data: croppedBase64, mimeType: 'image/jpeg' });
+      cancelCrop();
+    } else if (mode === 'ocr') {
+      setChatState(prev => ({ ...prev, isLoading: true }));
+      cancelCrop(); // Go back to chat to show loading
+      try {
+        const text = await extractTextFromImage(croppedBase64);
+        setInputText(prev => (prev + "\n" + text).trim());
+      } catch (e) {
+        console.error(e);
+        setChatState(prev => ({ ...prev, error: "OCR Failed" }));
+      } finally {
+        setChatState(prev => ({ ...prev, isLoading: false }));
+      }
+    }
   };
 
   // 2. Audio Recording (STT)
@@ -273,29 +452,23 @@ export const GlassOverlay: React.FC = () => {
 
   // 3. Messaging Logic
   const handleSendMessage = async () => {
-    if (!inputText.trim() && !mediaStream) return;
+    if (!inputText.trim() && !mediaStream && !attachedImage) return;
     if (chatState.isLoading || !isOnline) return;
 
     const currentText = inputText.trim();
     
-    // Capture screen if active
-    let screenshot: ScreenshotData | null = null;
-    if (isScreenShared) {
-      screenshot = await captureFrame();
-    }
+    // Priority: Attached cropped image -> Full Screen Snapshot -> Text only
+    let screenshot: ScreenshotData | null = attachedImage;
 
-    // If image attached, force use of PRO model (Gemini 3 Pro Preview) for vision
-    // If text only, check config for Thinking or Default Flash
-    let targetModel = chatState.config.useThinking ? ModelType.PRO : ModelType.FLASH;
-    if (screenshot) {
-      targetModel = ModelType.PRO;
+    if (!screenshot && isScreenShared) {
+      screenshot = await captureFrame();
     }
 
     // Create User Message
     const userMessage: Message = {
       id: Date.now().toString(),
       role: 'user',
-      text: currentText + (screenshot ? " [Screen Context]" : ""),
+      text: currentText + (screenshot ? (attachedImage ? " [Region Image]" : " [Screen Context]") : ""),
       timestamp: Date.now()
     };
 
@@ -306,21 +479,22 @@ export const GlassOverlay: React.FC = () => {
       error: null
     }));
     setInputText('');
+    setAttachedImage(null); // Clear attached image after sending
 
-    // Prepare Session
-    // If the target model differs from the current session model (implied by config), recreate session
-    // We always recreate here to ensure fresh config (like image support) is applied correctly
     const history: Content[] = chatState.messages.map(msg => ({
       role: msg.role,
       parts: [{ text: msg.text }]
     }));
-
+    
     const session = createChatSession(
-      targetModel,
-      undefined, 
-      history, 
-      chatState.config.useThinking,
-      chatState.config.useSearch
+      {
+        model: chatState.config.model,
+        temperature: chatState.config.temperature,
+        systemInstruction: chatState.config.systemInstruction,
+        useThinking: chatState.config.useThinking,
+        useSearch: chatState.config.useSearch
+      },
+      history
     );
 
     // Placeholder Bot Message
@@ -340,7 +514,7 @@ export const GlassOverlay: React.FC = () => {
       let fullResponse = '';
       await sendMessageStream(
         session,
-        currentText || (screenshot ? "Analyze this screen." : ""),
+        currentText || (screenshot ? "Analyze this." : ""),
         screenshot,
         (chunk) => {
           fullResponse += chunk;
@@ -364,7 +538,6 @@ export const GlassOverlay: React.FC = () => {
         )
       }));
 
-      // Update reference for next turn
       chatSessionRef.current = session;
 
     } catch (error) {
@@ -379,7 +552,7 @@ export const GlassOverlay: React.FC = () => {
 
   // --- Drag Logic ---
   const handleMouseDown = (e: React.MouseEvent) => {
-    if (isPiP) return;
+    if (isPiP || isCropping) return;
     if (e.button !== 0) return;
     if ((e.target as HTMLElement).closest('button') || (e.target as HTMLElement).closest('.no-drag')) return;
     if (overlayRef.current) {
@@ -394,7 +567,7 @@ export const GlassOverlay: React.FC = () => {
 
   useEffect(() => {
     const handleMouseMove = (e: MouseEvent) => {
-      if (isDragging && !isPiP) {
+      if (isDragging && !isPiP && !isCropping) {
         e.preventDefault();
         setPosition({
           x: e.clientX - dragOffsetRef.current.x,
@@ -411,7 +584,7 @@ export const GlassOverlay: React.FC = () => {
       window.removeEventListener('mousemove', handleMouseMove);
       window.removeEventListener('mouseup', handleMouseUp);
     };
-  }, [isDragging, isPiP]);
+  }, [isDragging, isPiP, isCropping]);
 
   // --- PiP Logic ---
   const togglePiP = async () => {
@@ -460,7 +633,6 @@ export const GlassOverlay: React.FC = () => {
   // --- Rendering ---
 
   if (!isVisible) {
-    // Global keyboard listener still active to toggle back
     return null;
   }
 
@@ -475,29 +647,103 @@ export const GlassOverlay: React.FC = () => {
     );
   }
 
+  // Styles for normal mode vs Cropping mode
+  // In Cropping mode, we maximize the container to viewport to allow full screen selection
   const containerStyle: React.CSSProperties = isPiP 
     ? { width: '100%', height: '100vh', borderRadius: 0, border: 'none' }
-    : position 
-      ? { left: `${position.x}px`, top: `${position.y}px`, transform: 'none' }
-      : {};
+    : isCropping
+      ? { inset: 0, width: '100%', height: '100%', transform: 'none', borderRadius: 0 }
+      : position 
+        ? { left: `${position.x}px`, top: `${position.y}px`, transform: 'none' }
+        : {};
 
-  // Dynamic styling based on Stealth Mode
   const stealthClasses = isStealth 
     ? 'bg-black/5 backdrop-blur-[2px] border-white/5 shadow-none opacity-10 hover:opacity-100 hover:bg-black/80 hover:backdrop-blur-2xl hover:shadow-2xl hover:border-white/20' 
     : 'bg-gray-950/30 backdrop-blur-3xl border-white/10 shadow-[0_20px_50px_rgba(0,0,0,0.5)]';
+  
+  const croppingClasses = isCropping ? 'bg-black/80 cursor-crosshair' : stealthClasses;
 
   const content = (
     <div 
       ref={overlayRef}
       style={containerStyle}
       className={`${isPiP ? 'relative' : 'fixed top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2'} 
-        ${isPiP ? '' : isMinimized ? 'w-[380px] h-[64px]' : 'w-[90vw] h-[80vh] md:w-[500px] md:h-[700px]'} 
-        ${isPiP ? 'bg-black' : stealthClasses} 
-        border z-50 flex flex-col rounded-[32px] overflow-hidden transition-all duration-500 ease-out group/overlay`}
+        ${isPiP || isCropping ? '' : isMinimized ? 'w-[380px] h-[64px]' : 'w-[90vw] h-[80vh] md:w-[500px] md:h-[700px]'} 
+        ${isPiP ? 'bg-black' : croppingClasses} 
+        border z-50 flex flex-col ${isCropping ? '' : 'rounded-[32px]'} overflow-hidden transition-all duration-500 ease-out group/overlay`}
+      onMouseDown={isCropping ? handleCropMouseDown : undefined}
+      onMouseMove={isCropping ? handleCropMouseMove : undefined}
+      onMouseUp={isCropping ? handleCropMouseUp : undefined}
     >
-      {/* --- Header --- */}
+      
+      {/* --- Cropping UI Layer --- */}
+      {isCropping && tempScreenshot && (
+        <div className="absolute inset-0 z-50 flex flex-col">
+          {/* Background Screenshot */}
+          <img 
+            src={tempScreenshot} 
+            alt="Screen Capture" 
+            className="absolute inset-0 w-full h-full object-contain opacity-60 pointer-events-none select-none"
+          />
+          
+          {/* Selection Box */}
+          {cropRect && (
+             <div 
+              className="absolute border-2 border-red-500 bg-white/10 backdrop-contrast-125 shadow-[0_0_0_9999px_rgba(0,0,0,0.5)] pointer-events-none"
+              style={{
+                left: cropRect.x,
+                top: cropRect.y,
+                width: cropRect.w,
+                height: cropRect.h
+              }}
+             >
+                <div className="absolute -top-6 left-0 bg-red-500 text-white text-[10px] px-1.5 py-0.5 rounded-t font-bold">
+                  {Math.round(cropRect.w)} x {Math.round(cropRect.h)}
+                </div>
+             </div>
+          )}
+
+          {/* Cropping Toolbar */}
+          <div className="absolute bottom-10 left-1/2 -translate-x-1/2 flex items-center gap-4 bg-gray-900 p-2 rounded-full border border-white/20 shadow-2xl pointer-events-auto">
+             <button 
+               onClick={cancelCrop}
+               className="p-3 hover:bg-white/10 rounded-full text-white/60 hover:text-white transition-colors"
+               title="Cancel"
+             >
+               <X size={20} />
+             </button>
+             
+             <div className="w-px h-8 bg-white/10" />
+
+             <button 
+               onClick={() => processCrop('attach')}
+               disabled={!cropRect || cropRect.w < 10}
+               className="flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 disabled:hover:bg-emerald-600 rounded-full text-white font-medium transition-colors"
+             >
+               <ImageIcon size={16} />
+               <span>Use Image</span>
+             </button>
+
+             <button 
+               onClick={() => processCrop('ocr')}
+               disabled={!cropRect || cropRect.w < 10}
+               className="flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 disabled:hover:bg-indigo-600 rounded-full text-white font-medium transition-colors"
+             >
+               <ScanLine size={16} />
+               <span>Scan Text</span>
+             </button>
+          </div>
+          
+          <div className="absolute top-10 left-1/2 -translate-x-1/2 px-6 py-2 bg-black/70 backdrop-blur-md rounded-full text-white font-medium border border-white/10 pointer-events-none">
+             Drag to select a region
+          </div>
+        </div>
+      )}
+
+      {/* --- Header (Hidden while cropping) --- */}
+      {!isCropping && (
       <div 
-        className={`flex items-center justify-between px-5 py-4 select-none ${!isPiP && !isMinimized ? 'cursor-grab active:cursor-grabbing' : ''} bg-gradient-to-b from-white/5 to-transparent`}
+        className={`relative flex items-center justify-between px-5 py-4 select-none group/header ${!isPiP && !isMinimized ? 'cursor-grab active:cursor-grabbing' : ''} transition-colors duration-300 ${isDragging ? 'bg-white/10 border-b border-white/10' : 'bg-gradient-to-b from-white/5 to-transparent'}`}
         onMouseDown={handleMouseDown}
         onDoubleClick={() => !isPiP && setIsMinimized(!isMinimized)}
       >
@@ -511,17 +757,29 @@ export const GlassOverlay: React.FC = () => {
           {isPiP && <div className="w-3 h-3 rounded-full bg-emerald-500 animate-pulse" />}
         </div>
 
-        <div className="flex items-center gap-2 pointer-events-none">
-          <div className="relative">
-            <div className={`absolute inset-0 blur-sm bg-emerald-500/30 rounded-full ${isStealth ? 'opacity-0 group-hover/overlay:opacity-100' : ''}`} />
-            <Sparkles className={`w-4 h-4 text-emerald-400 relative z-10 ${isStealth ? 'opacity-50 group-hover/overlay:opacity-100' : ''}`} />
+        {/* Drag Indicator + Title */}
+        <div className="flex items-center gap-3 pointer-events-none">
+          {!isPiP && !isMinimized && (
+             <div className={`flex flex-col gap-0.5 p-1 rounded-md transition-opacity duration-300 ${isDragging ? 'opacity-100' : 'opacity-30 group-hover/header:opacity-70'}`}>
+                <GripHorizontal size={16} className="text-white" />
+             </div>
+          )}
+
+          <div className="flex items-center gap-2">
+            <div className="relative">
+              <div className={`absolute inset-0 blur-sm bg-emerald-500/30 rounded-full ${isStealth ? 'opacity-0 group-hover/overlay:opacity-100' : ''}`} />
+              <Sparkles className={`w-4 h-4 text-emerald-400 relative z-10 ${isStealth ? 'opacity-50 group-hover/overlay:opacity-100' : ''}`} />
+            </div>
+            <span className={`text-sm font-medium tracking-wide drop-shadow-md ${isStealth ? 'text-white/30 group-hover/overlay:text-white/90' : 'text-white/90'}`}>Gemini</span>
           </div>
-          <span className={`text-sm font-medium tracking-wide drop-shadow-md ${isStealth ? 'text-white/30 group-hover/overlay:text-white/90' : 'text-white/90'}`}>Gemini</span>
         </div>
 
         <div className="flex items-center gap-1 text-white/50 no-drag">
           <button onClick={() => setIsStealth(!isStealth)} className={`p-1.5 hover:bg-white/10 rounded-full transition-colors ${isStealth ? 'text-indigo-400' : ''}`} title="Toggle Stealth Mode (Alt+S)">
             {isStealth ? <Ghost size={14} /> : <Eye size={14} />}
+          </button>
+          <button onClick={() => setShowSettings(!showSettings)} className={`p-1.5 hover:bg-white/10 rounded-full transition-colors ${showSettings ? 'text-white bg-white/10' : ''}`} title="Settings">
+            <Settings size={14} />
           </button>
           <button onClick={togglePiP} className={`p-1.5 hover:bg-white/10 rounded-full transition-colors ${isPiP ? 'text-emerald-400' : ''}`} title="Pop Out"><ExternalLink size={14} /></button>
           <button onClick={() => setChatState(prev => ({ ...prev, messages: [] }))} className="p-1.5 hover:bg-white/10 rounded-full transition-colors" title="Clear Chat"><RefreshCw size={14} /></button>
@@ -532,9 +790,10 @@ export const GlassOverlay: React.FC = () => {
            )}
         </div>
       </div>
+      )}
 
-      {/* --- Toolbar --- */}
-      {!isMinimized && (
+      {/* --- Toolbar (Hidden while cropping) --- */}
+      {!isMinimized && !showSettings && !isCropping && (
         <div className={`px-4 py-2 flex items-center gap-2 bg-white/5 border-b border-white/5 backdrop-blur-sm overflow-x-auto scrollbar-hide transition-opacity duration-300 ${isStealth ? 'opacity-0 group-hover/overlay:opacity-100' : 'opacity-100'}`}>
            <button
             onClick={() => setChatState(prev => ({...prev, config: {...prev.config, useThinking: !prev.config.useThinking}}))}
@@ -559,11 +818,94 @@ export const GlassOverlay: React.FC = () => {
              {isScreenShared ? <Monitor size={12} /> : <Eye size={12} />}
              <span>{isScreenShared ? 'Watching' : 'Watch Screen'}</span>
            </button>
+
+           {/* New Capture Button */}
+           <button
+             onClick={startRegionCapture}
+             className="flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-all bg-white/5 text-white/40 border border-transparent hover:bg-white/10 hover:text-pink-300"
+             title="Snipping Tool"
+           >
+             <Crop size={12} />
+             <span>Crop & Ask</span>
+           </button>
         </div>
       )}
 
-      {/* --- Chat Area --- */}
-      <div className={`flex-1 flex flex-col overflow-hidden transition-opacity duration-300 ${isMinimized && !isPiP ? 'opacity-0' : 'opacity-100'}`}>
+      {/* --- Settings View --- */}
+      {showSettings && !isMinimized && !isCropping && (
+        <div className="flex-1 flex flex-col bg-gray-950/80 backdrop-blur-xl p-6 overflow-y-auto animate-fade-in custom-scrollbar">
+           <div className="flex items-center gap-3 mb-6 text-white/80">
+              <button onClick={() => setShowSettings(false)} className="p-2 rounded-full hover:bg-white/10"><ChevronLeft size={18}/></button>
+              <h2 className="text-lg font-semibold">Model Configuration</h2>
+           </div>
+
+           <div className="space-y-6">
+             {/* Model Select */}
+             <div className="space-y-2">
+               <label className="text-xs font-medium text-white/50 uppercase tracking-wider">Model Selection</label>
+               <div className="grid gap-2">
+                  <button 
+                    onClick={() => setChatState(prev => ({...prev, config: {...prev.config, model: ModelType.FLASH}}))}
+                    className={`flex items-center justify-between p-4 rounded-xl border transition-all ${chatState.config.model === ModelType.FLASH ? 'bg-emerald-500/10 border-emerald-500/50 text-emerald-400' : 'bg-white/5 border-white/10 text-white/60 hover:bg-white/10'}`}
+                  >
+                     <div className="text-left">
+                       <div className="font-medium text-sm">Gemini 2.5 Flash</div>
+                       <div className="text-xs opacity-60 mt-0.5">Fast, efficient, multimodal</div>
+                     </div>
+                     {chatState.config.model === ModelType.FLASH && <div className="w-2 h-2 rounded-full bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.5)]"/>}
+                  </button>
+
+                  <button 
+                    onClick={() => setChatState(prev => ({...prev, config: {...prev.config, model: ModelType.PRO}}))}
+                    className={`flex items-center justify-between p-4 rounded-xl border transition-all ${chatState.config.model === ModelType.PRO ? 'bg-indigo-500/10 border-indigo-500/50 text-indigo-400' : 'bg-white/5 border-white/10 text-white/60 hover:bg-white/10'}`}
+                  >
+                     <div className="text-left">
+                       <div className="font-medium text-sm">Gemini 3 Pro Preview</div>
+                       <div className="text-xs opacity-60 mt-0.5">High reasoning, complex tasks</div>
+                     </div>
+                     {chatState.config.model === ModelType.PRO && <div className="w-2 h-2 rounded-full bg-indigo-400 shadow-[0_0_10px_rgba(129,140,248,0.5)]"/>}
+                  </button>
+               </div>
+             </div>
+
+             {/* Temperature */}
+             <div className="space-y-3">
+                <div className="flex justify-between items-center">
+                  <label className="text-xs font-medium text-white/50 uppercase tracking-wider">Creativity (Temperature)</label>
+                  <span className="text-xs font-mono text-white/80">{chatState.config.temperature.toFixed(1)}</span>
+                </div>
+                <input 
+                  type="range" 
+                  min="0" 
+                  max="2" 
+                  step="0.1"
+                  value={chatState.config.temperature}
+                  onChange={(e) => setChatState(prev => ({...prev, config: {...prev.config, temperature: parseFloat(e.target.value)}}))}
+                  className="w-full h-1.5 bg-white/10 rounded-full appearance-none cursor-pointer accent-emerald-500"
+                />
+                <div className="flex justify-between text-[10px] text-white/30">
+                  <span>Precise</span>
+                  <span>Balanced</span>
+                  <span>Creative</span>
+                </div>
+             </div>
+
+             {/* System Instructions */}
+             <div className="space-y-2">
+               <label className="text-xs font-medium text-white/50 uppercase tracking-wider">System Instructions (Persona)</label>
+               <textarea 
+                 value={chatState.config.systemInstruction}
+                 onChange={(e) => setChatState(prev => ({...prev, config: {...prev.config, systemInstruction: e.target.value}}))}
+                 className="w-full h-32 bg-black/20 border border-white/10 rounded-xl p-3 text-sm text-white/80 focus:border-emerald-500/50 outline-none resize-none custom-scrollbar"
+                 placeholder="Define how the AI should behave..."
+               />
+             </div>
+           </div>
+        </div>
+      )}
+
+      {/* --- Chat Area (Hidden while cropping) --- */}
+      <div className={`flex-1 flex flex-col overflow-hidden transition-opacity duration-300 ${isMinimized && !isPiP ? 'opacity-0' : 'opacity-100'} ${showSettings || isCropping ? 'hidden' : 'flex'}`}>
         <div className={`flex-1 overflow-y-auto p-5 space-y-6 custom-scrollbar scroll-smooth ${isStealth ? 'opacity-20 group-hover/overlay:opacity-100 transition-opacity duration-500' : ''}`}>
           {chatState.messages.map((msg) => (
             <MessageBubble key={msg.id} message={msg} />
@@ -578,6 +920,19 @@ export const GlassOverlay: React.FC = () => {
 
         {/* --- Input Area --- */}
         <div className={`p-4 bg-gradient-to-t from-black/40 to-transparent pt-8 transition-opacity duration-300 ${isStealth ? 'opacity-0 group-hover/overlay:opacity-100' : 'opacity-100'}`}>
+           
+           {/* Attached Image Preview */}
+           {attachedImage && (
+             <div className="mb-3 flex items-center gap-3 bg-white/10 rounded-lg p-2 w-fit backdrop-blur-md border border-white/10 animate-fade-in-up">
+               <img src={`data:${attachedImage.mimeType};base64,${attachedImage.data}`} alt="Attached" className="h-12 rounded-md" />
+               <div className="flex flex-col">
+                 <span className="text-xs font-medium text-white/80">Region Capture</span>
+                 <span className="text-[10px] text-white/40">Attached</span>
+               </div>
+               <button onClick={() => setAttachedImage(null)} className="ml-2 p-1 hover:bg-white/20 rounded-full text-white/60 hover:text-white"><X size={12}/></button>
+             </div>
+           )}
+
            <div className={`relative flex items-center gap-2 bg-gray-900/60 backdrop-blur-xl rounded-[24px] border border-white/10 px-2 py-1 focus-within:border-white/20 focus-within:bg-gray-900/80 transition-all duration-300 shadow-lg ${!isOnline ? 'opacity-50' : ''}`}>
               
               {/* Mic Button */}
@@ -594,16 +949,16 @@ export const GlassOverlay: React.FC = () => {
                 value={inputText}
                 onChange={(e) => setInputText(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
-                placeholder={isRecording ? "Listening..." : isScreenShared ? "Ask about this..." : "Type a message..."}
+                placeholder={isRecording ? "Listening..." : isScreenShared ? "Ask about this..." : attachedImage ? "Ask about this region..." : "Type a message..."}
                 className="flex-1 bg-transparent text-white placeholder-white/30 px-2 py-3 outline-none font-light"
                 disabled={chatState.isLoading || !isOnline}
               />
 
               <button
                 onClick={handleSendMessage}
-                disabled={(!inputText.trim() && !isScreenShared) || chatState.isLoading}
+                disabled={(!inputText.trim() && !isScreenShared && !attachedImage) || chatState.isLoading}
                 className={`p-3 rounded-[20px] transition-all duration-300 ${
-                   (inputText.trim() || isScreenShared) && !chatState.isLoading
+                   (inputText.trim() || isScreenShared || attachedImage) && !chatState.isLoading
                     ? 'bg-white text-black shadow-[0_0_20px_rgba(255,255,255,0.3)] hover:scale-105 active:scale-95'
                     : 'bg-white/5 text-white/20 cursor-not-allowed'
                 }`}
@@ -614,7 +969,11 @@ export const GlassOverlay: React.FC = () => {
            <div className="flex justify-between mt-3 px-3">
              <div className="flex items-center gap-2 text-[10px] text-white/30 uppercase tracking-wider font-medium">
                 {chatState.config.useThinking ? <BrainCircuit size={10} className="text-indigo-400" /> : null}
-                {chatState.config.useThinking ? 'Reasoning Active' : 'Fast Mode'}
+                {chatState.config.useThinking 
+                  ? 'Reasoning Active (Pro)' 
+                  : chatState.config.model === ModelType.PRO 
+                    ? 'Gemini 3 Pro' 
+                    : 'Gemini Flash'}
              </div>
              <div className={`flex items-center gap-1.5 text-[10px] uppercase tracking-wider font-medium ${isOnline ? 'text-emerald-500/50' : 'text-red-500/50'}`}>
                 <div className={`w-1.5 h-1.5 rounded-full ${isOnline ? 'bg-emerald-500' : 'bg-red-500'} animate-pulse`} />

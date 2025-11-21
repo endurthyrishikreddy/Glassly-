@@ -2,6 +2,7 @@
   "name": "Gemini Glass Overlay",
   "description": "A transparent, glass-morphism chat overlay powered by Gemini 2.5 Flash.",
   "requestFramePermissions": [
-    "microphone"
+    "microphone",
+    "display-capture"
   ]
 }

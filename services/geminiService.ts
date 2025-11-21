@@ -10,32 +10,47 @@ export const getAiClient = (): GoogleGenAI => {
   return ai;
 };
 
+interface SessionConfig {
+  model: string;
+  temperature: number;
+  systemInstruction: string;
+  useThinking: boolean;
+  useSearch: boolean;
+}
+
 export const createChatSession = (
-  model: string,
-  systemInstruction?: string,
-  history?: Content[],
-  useThinking: boolean = false,
-  useSearch: boolean = false
+  config: SessionConfig,
+  history?: Content[]
 ): Chat => {
   const client = getAiClient();
   
   const tools = [];
-  if (useSearch) {
+  if (config.useSearch) {
     tools.push({ googleSearch: {} });
   }
 
-  const config: any = {
-    systemInstruction: systemInstruction || "You are a helpful, concise AI assistant living in a transparent glass overlay. Keep answers brief and relevant.",
+  // Determine effective model
+  // If Thinking is enabled, we MUST use a model that supports it (usually Pro)
+  // and ignore the temperature as thinking models handle it differently or use budget.
+  const effectiveModel = config.useThinking ? ModelType.PRO : config.model;
+
+  const generationConfig: any = {
+    systemInstruction: config.systemInstruction,
     tools: tools.length > 0 ? tools : undefined,
   };
 
-  if (useThinking && model.includes('gemini-3-pro')) {
-    config.thinkingConfig = { thinkingBudget: 16384 }; // Set budget for thinking
+  if (!config.useThinking) {
+     // Only apply temperature if NOT thinking (thinking models manage their own diversity mostly via budget)
+     generationConfig.temperature = config.temperature;
+  }
+
+  if (config.useThinking) {
+    generationConfig.thinkingConfig = { thinkingBudget: 16384 }; 
   }
 
   return client.chats.create({
-    model: model,
-    config: config,
+    model: effectiveModel,
+    config: generationConfig,
     history: history,
   });
 };
@@ -66,14 +81,6 @@ export const sendMessageStream = async (
     for await (const chunk of resultStream) {
       // Extract text
       const textPart = chunk.text;
-      
-      // Extract thinking process if available (depends on structure, usually in candidate parts)
-      // Note: The SDK handles basic text extraction via .text, but specific "thought" parts might need manual inspection
-      // For now, we rely on the model returning the thought in the stream which usually appears before the final answer
-      // or as part of the text if not separated. 
-      // Gemini 2.5 thinking models often output thoughts in specific parts, but for this implementation
-      // we will primarily consume the .text property which aggregates the output.
-      
       if (textPart) {
         onChunk(textPart);
       }
@@ -96,6 +103,23 @@ export const transcribeAudio = async (audioBase64: string): Promise<string> => {
       parts: [
         { inlineData: { mimeType: 'audio/wav', data: audioBase64 } },
         { text: "Transcribe this audio exactly as spoken. Do not add any other text." }
+      ]
+    }
+  });
+  return response.text || "";
+};
+
+// --- Vision Services ---
+
+export const extractTextFromImage = async (imageBase64: string, mimeType: string = 'image/jpeg'): Promise<string> => {
+  const client = getAiClient();
+  const response = await client.models.generateContent({
+    model: ModelType.FLASH,
+    contents: {
+      role: 'user',
+      parts: [
+        { inlineData: { mimeType: mimeType, data: imageBase64 } },
+        { text: "OCR Task: Extract and output ALL text visible in this image. Preserve formatting where possible. Do not add conversational filler. Just return the text." }
       ]
     }
   });
