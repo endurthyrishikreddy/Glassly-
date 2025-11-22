@@ -5,7 +5,7 @@ import {
   WifiOff, Wifi, Eye, X, Mic, BrainCircuit, Globe, Monitor, GripHorizontal,
   Ghost, EyeOff, Settings, ChevronLeft, Save, Crop, ScanLine, Check, Image as ImageIcon,
   Loader2, CheckCircle, MapPin, ChevronDown, Cpu, Wrench, Palette, Sliders, MessageSquare,
-  History, Trash2, Archive, Clock
+  History, Trash2, Archive, Clock, CloudOff
 } from 'lucide-react';
 import { Message, ChatState, ModelType, ChatSession } from '../types';
 import { createChatSession, sendMessageStream, transcribeAudio, extractTextFromImage } from '../services/geminiService';
@@ -574,8 +574,9 @@ export const GlassOverlay: React.FC = () => {
 
   // 3. Messaging Logic
   const handleSendMessage = async () => {
+    if (!isOnline) return; // Prevent sending if offline
     if (!inputText.trim() && !mediaStream && !attachedImage) return;
-    if (chatState.isLoading || !isOnline) return;
+    if (chatState.isLoading) return;
 
     const currentText = inputText.trim();
     let screenshot: ScreenshotData | null = attachedImage;
@@ -927,6 +928,21 @@ export const GlassOverlay: React.FC = () => {
           100% { top: 100%; opacity: 0; }
         }
       `}</style>
+
+      {/* --- Offline Mode Banner --- */}
+      {!isOnline && (
+        <div className="absolute top-16 inset-x-4 z-50 bg-red-900/90 border border-red-500/50 rounded-xl p-4 backdrop-blur-xl shadow-2xl animate-fade-in">
+          <div className="flex items-center gap-3 text-white">
+            <div className="p-2 bg-red-500/20 rounded-full">
+              <WifiOff size={24} className="text-red-200" />
+            </div>
+            <div>
+              <h3 className="font-bold text-sm">Internet Disconnected</h3>
+              <p className="text-xs text-white/70 mt-0.5">Offline Mode Active. Please reconnect to resume AI features.</p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* --- Resize Handles --- */}
       {!isPiP && !isMinimized && !isCropping && (
@@ -1383,12 +1399,13 @@ export const GlassOverlay: React.FC = () => {
              ${inputHighlight 
                 ? 'border-emerald-500 shadow-[0_0_30px_rgba(16,185,129,0.3)] bg-emerald-950/30' 
                 : 'border-white/10 focus-within:border-white/20 focus-within:bg-gray-900/80'} 
-             ${!isOnline ? 'opacity-50' : ''}`}>
+             ${!isOnline ? 'opacity-50 border-red-500/30' : ''}`}>
               
               {/* Mic Button */}
               <button 
                 onClick={toggleRecording}
-                className={`p-3 rounded-full transition-all ${isRecording ? 'bg-red-500 text-white animate-pulse' : 'text-white/50 hover:text-white hover:bg-white/10'}`}
+                disabled={!isOnline}
+                className={`p-3 rounded-full transition-all ${isRecording ? 'bg-red-500 text-white animate-pulse' : 'text-white/50 hover:text-white hover:bg-white/10'} ${!isOnline ? 'opacity-30 cursor-not-allowed' : ''}`}
               >
                 <Mic size={20} />
               </button>
@@ -1399,21 +1416,23 @@ export const GlassOverlay: React.FC = () => {
                 value={inputText}
                 onChange={(e) => setInputText(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
-                placeholder={isRecording ? "Listening..." : isScreenShared ? "Ask about this..." : attachedImage ? "Ask about this region..." : "Type a message..."}
-                className="flex-1 bg-transparent text-white placeholder-white/30 px-2 py-3 outline-none font-light min-w-0"
+                placeholder={!isOnline ? "Waiting for connection..." : isRecording ? "Listening..." : isScreenShared ? "Ask about this..." : attachedImage ? "Ask about this region..." : "Type a message..."}
+                className={`flex-1 bg-transparent text-white placeholder-white/30 px-2 py-3 outline-none font-light min-w-0 ${!isOnline ? 'cursor-not-allowed' : ''}`}
                 disabled={chatState.isLoading || !isOnline}
               />
 
               <button
                 onClick={handleSendMessage}
-                disabled={(!inputText.trim() && !isScreenShared && !attachedImage) || chatState.isLoading}
+                disabled={(!inputText.trim() && !isScreenShared && !attachedImage) || chatState.isLoading || !isOnline}
                 className={`p-3 rounded-[20px] transition-all duration-300 flex-shrink-0 ${
-                   (inputText.trim() || isScreenShared || attachedImage) && !chatState.isLoading
-                    ? 'bg-white text-black shadow-[0_0_20px_rgba(255,255,255,0.3)] hover:scale-105 active:scale-95'
-                    : 'bg-white/5 text-white/20 cursor-not-allowed'
+                   !isOnline 
+                    ? 'bg-white/5 text-white/10 cursor-not-allowed'
+                    : (inputText.trim() || isScreenShared || attachedImage) && !chatState.isLoading
+                      ? 'bg-white text-black shadow-[0_0_20px_rgba(255,255,255,0.3)] hover:scale-105 active:scale-95'
+                      : 'bg-white/5 text-white/20 cursor-not-allowed'
                 }`}
               >
-                 {chatState.isLoading ? <div className="w-5 h-5 border-2 border-black/20 border-t-black rounded-full animate-spin" /> : <Send size={18} />}
+                 {chatState.isLoading ? <div className="w-5 h-5 border-2 border-black/20 border-t-black rounded-full animate-spin" /> : !isOnline ? <CloudOff size={18} /> : <Send size={18} />}
               </button>
            </div>
            <div className="flex justify-between mt-3 px-3">
@@ -1426,7 +1445,7 @@ export const GlassOverlay: React.FC = () => {
                     : 'Gemini Flash'}
              </div>
              <div className={`flex items-center gap-1.5 text-[10px] uppercase tracking-wider font-medium ${isOnline ? 'text-emerald-500/50' : 'text-red-500/50'}`}>
-                <div className={`w-1.5 h-1.5 rounded-full ${isOnline ? 'bg-emerald-500' : 'bg-red-500'} animate-pulse`} />
+                <div className={`w-1.5 h-1.5 rounded-full ${isOnline ? 'bg-emerald-500' : 'bg-red-500'} ${isOnline ? 'animate-pulse' : ''}`} />
                 {isOnline ? 'Online' : 'Offline'}
              </div>
              
